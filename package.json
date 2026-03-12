@@ -1,0 +1,33 @@
+{
+  "name": "web-perf-audit",
+  "version": "1.0.0",
+  "description": "Zero-dependency Chrome CDP performance auditor — Web Vitals, Navigation Timing, JS Coverage, resource waterfall, and HTML reports",
+  "type": "module",
+  "bin": {
+    "web-perf-audit": "./src/index.mjs"
+  },
+  "files": [
+    "src/"
+  ],
+  "keywords": [
+    "performance",
+    "audit",
+    "web-vitals",
+    "chrome",
+    "cdp",
+    "lighthouse-alternative",
+    "ttfb",
+    "lcp",
+    "fcp",
+    "cls",
+    "tbt",
+    "inp",
+    "profiler",
+    "zero-dependency"
+  ],
+  "author": "Oleh Khomenko",
+  "license": "MIT",
+"engines": {
+    "node": ">=18.0.0"
+  }
+}
