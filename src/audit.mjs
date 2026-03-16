@@ -468,13 +468,23 @@ export async function runAudit(cdp, targetUrl, options = {}) {
   // Rendering metrics from CDP Performance domain
   const { metrics: perfMetrics } = await cdp.send('Performance.getMetrics');
   const renderMetrics = {};
+  const memoryInfo = { jsHeapUsed: 0, jsHeapTotal: 0, domNodeCount: 0 };
   for (const m of perfMetrics) {
     if (['LayoutDuration', 'RecalcStyleDuration', 'ScriptDuration',
       'LayoutCount', 'RecalcStyleCount'].includes(m.name)) {
       // Durations are in seconds, convert to ms
       renderMetrics[m.name] = m.name.endsWith('Duration') ? m.value * 1000 : m.value;
     }
+    if (m.name === 'JSHeapUsedSize') memoryInfo.jsHeapUsed = m.value;
+    if (m.name === 'JSHeapTotalSize') memoryInfo.jsHeapTotal = m.value;
   }
+
+  // DOM node count
+  const { result: domCountResult } = await cdp.send('Runtime.evaluate', {
+    expression: 'document.querySelectorAll("*").length',
+    returnByValue: true,
+  });
+  memoryInfo.domNodeCount = domCountResult.value || 0;
 
   // Reset CPU throttling
   if (options.cpuThrottle && options.cpuThrottle > 1) {
@@ -500,5 +510,6 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     preloadLinks,
     serverTiming,
     renderMetrics,
+    memoryInfo,
   };
 }

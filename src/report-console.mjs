@@ -36,7 +36,7 @@ function printTiming(name, ms, explanation) {
 }
 
 export function printReport(data, meta = {}) {
-  const { connectionInfo, nav, vitals, tbt, longTaskDetails = [], tbtByScript = [], resourceEntries, resourceSummary, jsCoverage, renderBlocking, lcpElement = null, clsEntries = [], inp = 0, inpEntries = [], preloadLinks, serverTiming = [], fontsReady = 0, renderMetrics = null } = data;
+  const { connectionInfo, nav, vitals, tbt, longTaskDetails = [], tbtByScript = [], resourceEntries, resourceSummary, jsCoverage, renderBlocking, lcpElement = null, clsEntries = [], inp = 0, inpEntries = [], preloadLinks, serverTiming = [], fontsReady = 0, renderMetrics = null, memoryInfo = null } = data;
 
   // Emulation info
   if (meta.device) {
@@ -370,6 +370,16 @@ export function printReport(data, meta = {}) {
   }
   console.log();
 
+  // -- Memory & DOM --
+  if (memoryInfo && memoryInfo.jsHeapTotal > 0) {
+    console.log(`${BOLD}── Memory & DOM ──${RESET}\n`);
+    const heapPct = (memoryInfo.jsHeapUsed / memoryInfo.jsHeapTotal) * 100;
+    const heapColor = heapPct > 80 ? RED : heapPct > 50 ? YELLOW : GREEN;
+    console.log(`  JS Heap Used      ${heapColor}${fmtBytes(memoryInfo.jsHeapUsed)} / ${fmtBytes(memoryInfo.jsHeapTotal)} (${heapPct.toFixed(1)}%)${RESET}`);
+    console.log(`  DOM Nodes          ${memoryInfo.domNodeCount.toLocaleString()}`);
+    console.log();
+  }
+
   // -- JS Coverage & Execution Time --
   console.log(`${BOLD}── JS Coverage & Execution Time ──${RESET}\n`);
   const sortedCoverage = [...jsCoverage].sort((a, b) => b.unused - a.unused).slice(0, 15);
@@ -461,8 +471,8 @@ export function printReport(data, meta = {}) {
   }
   console.log();
 
-  // -- Initial Waterfall (load order) --
-  console.log(`${BOLD}── Initial Waterfall ──${RESET}\n`);
+  // -- Waterfall (load order) --
+  console.log(`${BOLD}── Waterfall ──${RESET}\n`);
 
   const criticalTypes = new Set(['link', 'css', 'script']);
   const loadOrder = [...resourceEntries]
@@ -527,60 +537,4 @@ export function printReport(data, meta = {}) {
   }
   console.log();
 
-  // -- Network Waterfall (ASCII) --
-  console.log(`${BOLD}── Network Waterfall (Top 20 Slowest) ──${RESET}\n`);
-
-  const timelineEnd = Math.max(...resourceEntries.map(r => r.responseEnd), 1);
-  const barWidth = 40;
-  const slowest = [...resourceEntries].sort((a, b) => b.duration - a.duration).slice(0, 20);
-
-  console.log(`  ${'Resource'.padEnd(42)} ${'Start'.padStart(7)} ${'Dur'.padStart(7)}  ${'Timeline'.padEnd(barWidth)}`);
-  console.log(`  ${'─'.repeat(42)} ${'─'.repeat(7)} ${'─'.repeat(7)}  ${'─'.repeat(barWidth)}`);
-
-  for (const r of slowest) {
-    const phases = computeResourcePhases(r);
-    let bar;
-    if (phases.length > 0) {
-      const chars = new Array(barWidth).fill(' ');
-      const colors = new Array(barWidth).fill('');
-      for (const p of phases) {
-        const pStart = Math.round((p.start / timelineEnd) * barWidth);
-        const pLen = Math.max(1, Math.round((p.duration / timelineEnd) * barWidth));
-        const ansi = PHASE_ANSI_COLORS[p.color] || CYAN;
-        for (let i = pStart; i < Math.min(pStart + pLen, barWidth); i++) {
-          chars[i] = '█';
-          colors[i] = ansi;
-        }
-      }
-      bar = '';
-      let currentColor = '';
-      for (let i = 0; i < barWidth; i++) {
-        if (chars[i] === '█') {
-          if (colors[i] !== currentColor) {
-            bar += colors[i];
-            currentColor = colors[i];
-          }
-          bar += '█';
-        } else {
-          if (currentColor !== '') {
-            bar += RESET;
-            currentColor = '';
-          }
-          bar += ' ';
-        }
-      }
-      if (currentColor !== '') bar += RESET;
-    } else {
-      const startFrac = r.startTime / timelineEnd;
-      const endFrac = r.responseEnd / timelineEnd;
-      const barStart = Math.round(startFrac * barWidth);
-      const barLen = Math.max(1, Math.round((endFrac - startFrac) * barWidth));
-      bar = ' '.repeat(barStart) + CYAN + '█'.repeat(barLen) + RESET + ' '.repeat(Math.max(0, barWidth - barStart - barLen));
-    }
-
-    console.log(
-      `  ${truncUrl(r.name, 40).padEnd(42)} ${fmtMs(r.startTime).padStart(7)} ${fmtMs(r.duration).padStart(7)}  ${bar}`,
-    );
-  }
-  console.log();
 }

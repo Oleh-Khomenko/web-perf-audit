@@ -99,7 +99,7 @@ if (args.includes('--help') || args.includes('-h')) {
     Render-Blocking      Resources with renderBlockingStatus === 'blocking'
     Preload Audit        Cross-references <link rel="preload"> with actual resource usage
     Largest Resources    Top 10 resources by transfer size
-    Network Waterfall    ASCII timeline of the 20 slowest resources
+
 
   Environment variables:
     CHROME_PATH              Path to a custom Chrome/Chromium binary

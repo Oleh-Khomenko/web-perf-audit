@@ -23,7 +23,7 @@ function urlWithTooltip(url, maxLen) {
  * @returns {string} Full HTML document string
  */
 export function generateHtml(data, meta) {
-  const { connectionInfo, nav, vitals, tbt, longTaskDetails = [], tbtByScript = [], resourceEntries, resourceSummary, jsCoverage, renderBlocking, lcpElement = null, clsEntries = [], inp = 0, inpEntries = [], preloadLinks, serverTiming = [], fontsReady = 0, renderMetrics = null } = data;
+  const { connectionInfo, nav, vitals, tbt, longTaskDetails = [], tbtByScript = [], resourceEntries, resourceSummary, jsCoverage, renderBlocking, lcpElement = null, clsEntries = [], inp = 0, inpEntries = [], preloadLinks, serverTiming = [], fontsReady = 0, renderMetrics = null, memoryInfo = null } = data;
 
   const dns = nav.domainLookupEnd - nav.domainLookupStart;
   const tcp = nav.connectEnd - nav.connectStart;
@@ -79,7 +79,6 @@ export function generateHtml(data, meta) {
 
   const largest = [...resourceEntries].sort((a, b) => b.transferSize - a.transferSize).slice(0, 10);
   const timelineEnd = Math.max(...resourceEntries.map(r => r.responseEnd), 1);
-  const slowest = [...resourceEntries].sort((a, b) => b.duration - a.duration).slice(0, 20);
   const resourceUrls = new Set(resourceEntries.map(r => r.name));
 
   return `<!DOCTYPE html>
@@ -602,6 +601,19 @@ ${Object.entries(resourceSummary).sort((a, b) => b[1].size - a[1].size).map(([ty
   </tbody>
 </table>
 
+${memoryInfo && memoryInfo.jsHeapTotal > 0 ? (() => {
+  const heapPct = (memoryInfo.jsHeapUsed / memoryInfo.jsHeapTotal) * 100;
+  const { color } = rate(heapPct, 50, 80);
+  return `<h2>Memory &amp; DOM</h2>
+<table>
+  <thead><tr><th>Metric</th><th class="r">Value</th></tr></thead>
+  <tbody>
+    <tr><td>JS Heap Used</td><td class="r" style="color:${CSS_COLORS[color]}">${fmtBytes(memoryInfo.jsHeapUsed)} / ${fmtBytes(memoryInfo.jsHeapTotal)} (${heapPct.toFixed(1)}%)</td></tr>
+    <tr><td>DOM Nodes</td><td class="r">${memoryInfo.domNodeCount.toLocaleString()}</td></tr>
+  </tbody>
+</table>`;
+})() : ''}
+
 <h2>JS Coverage &amp; Execution Time</h2>
 ${sortedCoverage.length > 0 ? `<table>
   <thead><tr><th>URL</th><th class="r">Total</th><th class="r">Used</th><th class="r">Unused</th><th class="r">Unused%</th><th class="r">Exec Time</th><th style="width:100px"></th></tr></thead>
@@ -650,7 +662,7 @@ ${largest.map(r => `    <tr><td class="url-cell mono">${urlWithTooltip(r.name, 5
   </tbody>
 </table>
 
-<h2>Initial Waterfall</h2>
+<h2>Waterfall</h2>
 <div class="waterfall-legend">
   <span><span class="waterfall-legend-dot" style="background:#94a3b8"></span> Queueing</span>
   <span><span class="waterfall-legend-dot" style="background:#fb923c"></span> Stalled</span>
@@ -692,22 +704,6 @@ ${(() => {
   })()}
 </div>
 
-<h2>Network Waterfall (Top 20 Slowest)</h2>
-<div style="margin-bottom:1rem">
-${slowest.map(r => {
-    const phases = computeResourcePhases(r);
-    const segments = phases.length > 0 ? phases.map(p => {
-      const left = (p.start / timelineEnd * 100).toFixed(2);
-      const width = Math.max(0.1, (p.duration / timelineEnd * 100)).toFixed(2);
-      return `<div class="waterfall-seg" style="left:${left}%;width:${width}%;background:${p.color}" title="${escHtml(p.name)}: ${fmtMs(p.duration)}"></div>`;
-    }).join('') : `<div class="waterfall-bar" style="left:${(r.startTime / timelineEnd * 100).toFixed(2)}%;width:${Math.max(0.5, (r.duration / timelineEnd * 100)).toFixed(2)}%"></div>`;
-    return `  <div class="waterfall-row">
-    <span class="waterfall-label">${urlWithTooltip(r.name, 35)}</span>
-    <span class="waterfall-times">${fmtMs(r.startTime)} / ${fmtMs(r.duration)}</span>
-    <div class="waterfall-track">${segments}</div>
-  </div>`;
-  }).join('\n')}
-</div>
 
 ${meta.numRuns > 1 && meta.allResults ? `<h2>All Runs</h2>
 <table>
