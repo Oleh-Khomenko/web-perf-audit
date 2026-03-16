@@ -65,6 +65,8 @@ let THROTTLE = null; // default: no throttling
 let CPU_THROTTLE = 1; // multiplier: 1 = no slowdown
 let DEVICE = DEVICE_PRESETS.desktop; // default: desktop
 let PARALLEL = false;
+let EXTRA_HEADERS = {};
+let EXTRA_COOKIES = [];
 
 const args = process.argv.slice(2);
 
@@ -84,6 +86,8 @@ if (args.includes('--help') || args.includes('-h')) {
     --device <preset>    Device emulation: desktop, tablet, mobile (default: desktop)
     --throttle <preset>  Simulate network conditions: slow-3g, fast-3g, 4g, none (default: 4g)
     --cpu-throttle <N>   CPU slowdown multiplier, e.g. 4 = 4x slower (default: 1, no throttle)
+    --header "Name: Val"  Add a custom HTTP header (repeatable)
+    --cookie "name=val"  Add a cookie for the target domain (repeatable)
     --html [path]        Save report as HTML file (default: perf-audit-{timestamp}.html in cwd)
     -h, --help           Show this help message
 
@@ -110,6 +114,8 @@ if (args.includes('--help') || args.includes('-h')) {
     web-perf-audit https://example.com --cpu-throttle 4
     web-perf-audit https://example.com --device mobile --throttle fast-3g --cpu-throttle 4
     web-perf-audit https://example.com --runs 5 --parallel
+    web-perf-audit https://example.com --header "Authorization: Bearer tok"
+    web-perf-audit https://example.com --cookie "session=abc123"
 `);
   process.exit(0);
 }
@@ -153,6 +159,28 @@ for (let i = 0; i < args.length; i++) {
   }
   else if (args[i] === '--parallel') {
     PARALLEL = true;
+  }
+  else if (args[i] === '--header' && args[i + 1]) {
+    const colonIdx = args[i + 1].indexOf(':');
+    if (colonIdx === -1) {
+      console.error(`Invalid header format: "${args[i + 1]}"\nExpected "Name: Value"`);
+      process.exit(1);
+    }
+    const name = args[i + 1].slice(0, colonIdx).trim();
+    const value = args[i + 1].slice(colonIdx + 1).trim();
+    EXTRA_HEADERS[name] = value;
+    i++;
+  }
+  else if (args[i] === '--cookie' && args[i + 1]) {
+    const eqIdx = args[i + 1].indexOf('=');
+    if (eqIdx === -1) {
+      console.error(`Invalid cookie format: "${args[i + 1]}"\nExpected "name=value"`);
+      process.exit(1);
+    }
+    const name = args[i + 1].slice(0, eqIdx).trim();
+    const value = args[i + 1].slice(eqIdx + 1).trim();
+    EXTRA_COOKIES.push({ name, value });
+    i++;
   }
   else if (args[i] === '--html') {
     // Next arg is either a path or another flag (or nothing)
@@ -307,7 +335,11 @@ async function main() {
     }
   }
 
-  const auditOpts = { throttle: THROTTLE, cpuThrottle: CPU_THROTTLE, device: DEVICE };
+  // Derive cookie domains from TARGET_URL now that URL is known
+  const targetDomain = new URL(TARGET_URL).hostname;
+  const resolvedCookies = EXTRA_COOKIES.map(c => ({ ...c, domain: targetDomain, path: '/' }));
+
+  const auditOpts = { throttle: THROTTLE, cpuThrottle: CPU_THROTTLE, device: DEVICE, extraHeaders: EXTRA_HEADERS, extraCookies: resolvedCookies };
 
   async function executeRun(runIndex) {
     // Create an isolated browser context (incognito-like) per run

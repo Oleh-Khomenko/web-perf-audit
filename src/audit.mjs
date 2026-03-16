@@ -191,6 +191,18 @@ export async function runAudit(cdp, targetUrl, options = {}) {
   const origin = new URL(targetUrl).origin;
   await cdp.send('Storage.clearDataForOrigin', { origin, storageTypes: 'all' });
 
+  // Set extra HTTP headers before navigation
+  if (options.extraHeaders && Object.keys(options.extraHeaders).length > 0) {
+    await cdp.send('Network.setExtraHTTPHeaders', { headers: options.extraHeaders });
+  }
+
+  // Set cookies before navigation
+  if (options.extraCookies && options.extraCookies.length > 0) {
+    for (const cookie of options.extraCookies) {
+      await cdp.send('Network.setCookie', cookie);
+    }
+  }
+
   // Force-close all sockets (kills keep-alive connections, TCP/TLS pool, and DNS cache)
   // Toggling offline drops every open socket; going back online forces fresh DNS + TCP + TLS
   await cdp.send('Network.emulateNetworkConditions', {

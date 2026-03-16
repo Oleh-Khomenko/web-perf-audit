@@ -60,6 +60,8 @@ web-perf-audit [url] [options]
 | `--device <preset>` | Device emulation: `desktop`, `tablet`, `mobile` | `desktop` |
 | `--throttle <preset>` | Network: `slow-3g`, `fast-3g`, `4g`, `none` | `none` |
 | `--cpu-throttle <N>` | CPU slowdown multiplier (e.g. `4` = 4x slower) | `1` |
+| `--header "Name: Val"` | Add custom HTTP header (repeatable) | — |
+| `--cookie "name=val"` | Add cookie for target domain (repeatable) | — |
 | `--html [path]` | Save HTML report (auto-named if no path given) | — |
 | `-h, --help` | Show help | — |
 
@@ -77,6 +79,15 @@ web-perf-audit https://example.com --runs 5 --parallel --html
 
 # Save HTML to specific file
 web-perf-audit https://example.com --html report.html
+
+# Audit a page behind authentication
+web-perf-audit https://example.com --header "Authorization: Bearer tok123"
+
+# Pass a session cookie
+web-perf-audit https://example.com --cookie "session=abc123"
+
+# Multiple headers and cookies
+web-perf-audit https://example.com --header "Authorization: Bearer tok" --header "X-Custom: val" --cookie "sid=abc"
 ```
 
 ## Report Sections
