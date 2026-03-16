@@ -3,6 +3,9 @@
  */
 
 import { request } from 'node:http';
+import { MinimalWebSocket } from './ws.mjs';
+
+const WebSocket = globalThis.WebSocket || MinimalWebSocket;
 
 export async function httpJson(url, method = 'GET') {
   return new Promise((resolve, reject) => {
@@ -35,7 +38,7 @@ export class CDPSession {
 
   async connect() {
     return new Promise((resolve, reject) => {
-      this._ws = new globalThis.WebSocket(this._wsUrl);
+      this._ws = new WebSocket(this._wsUrl);
       this._ws.addEventListener('open', () => resolve());
       this._ws.addEventListener('error', (e) => reject(e));
       this._ws.addEventListener('message', (event) => {

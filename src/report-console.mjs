@@ -2,7 +2,7 @@
  * Console report output with ANSI colors.
  */
 
-import { fmtMs, fmtBytes, truncUrl, rate, computeOverallScore, computeFcpPhases, computeLcpPhases, buildClsSessionWindows, computeInpPhases } from './format.mjs';
+import { fmtMs, fmtBytes, truncUrl, rate, computeOverallScore, computeFcpPhases, computeLcpPhases, buildClsSessionWindows, computeInpPhases, computeResourcePhases, PHASE_ANSI_COLORS } from './format.mjs';
 
 // ANSI color constants
 export const RESET = '\x1b[0m';
@@ -478,13 +478,48 @@ export function printReport(data, meta = {}) {
   for (const r of loadOrder) {
     const isBlocking = r.renderBlockingStatus === 'blocking';
     const blockTag = isBlocking ? ` ${RED}[RB]${RESET}` : '';
-    const barColor = isBlocking ? RED : CYAN;
 
-    const startFrac = r.startTime / waterfallEnd;
-    const endFrac = r.responseEnd / waterfallEnd;
-    const barStart = Math.round(startFrac * wfBarWidth);
-    const barLen = Math.max(1, Math.round((endFrac - startFrac) * wfBarWidth));
-    const bar = ' '.repeat(barStart) + barColor + '█'.repeat(barLen) + RESET + ' '.repeat(Math.max(0, wfBarWidth - barStart - barLen));
+    const phases = computeResourcePhases(r);
+    let bar;
+    if (phases.length > 0) {
+      // Build multi-colored bar from phases
+      const chars = new Array(wfBarWidth).fill(' ');
+      const colors = new Array(wfBarWidth).fill('');
+      for (const p of phases) {
+        const pStart = Math.round((p.start / waterfallEnd) * wfBarWidth);
+        const pLen = Math.max(1, Math.round((p.duration / waterfallEnd) * wfBarWidth));
+        const ansi = PHASE_ANSI_COLORS[p.color] || CYAN;
+        for (let i = pStart; i < Math.min(pStart + pLen, wfBarWidth); i++) {
+          chars[i] = '█';
+          colors[i] = ansi;
+        }
+      }
+      bar = '';
+      let currentColor = '';
+      for (let i = 0; i < wfBarWidth; i++) {
+        if (chars[i] === '█') {
+          if (colors[i] !== currentColor) {
+            bar += colors[i];
+            currentColor = colors[i];
+          }
+          bar += '█';
+        } else {
+          if (currentColor !== '') {
+            bar += RESET;
+            currentColor = '';
+          }
+          bar += ' ';
+        }
+      }
+      if (currentColor !== '') bar += RESET;
+    } else {
+      const barColor = isBlocking ? RED : CYAN;
+      const startFrac = r.startTime / waterfallEnd;
+      const endFrac = r.responseEnd / waterfallEnd;
+      const barStart = Math.round(startFrac * wfBarWidth);
+      const barLen = Math.max(1, Math.round((endFrac - startFrac) * wfBarWidth));
+      bar = ' '.repeat(barStart) + barColor + '█'.repeat(barLen) + RESET + ' '.repeat(Math.max(0, wfBarWidth - barStart - barLen));
+    }
 
     console.log(
       `  ${truncUrl(r.name, 34).padEnd(36)} ${(r.initiatorType || '').padEnd(8)} ${fmtMs(r.startTime).padStart(7)} ${fmtMs(r.duration).padStart(7)}  ${bar}${blockTag}`,
@@ -503,12 +538,45 @@ export function printReport(data, meta = {}) {
   console.log(`  ${'─'.repeat(42)} ${'─'.repeat(7)} ${'─'.repeat(7)}  ${'─'.repeat(barWidth)}`);
 
   for (const r of slowest) {
-    const startFrac = r.startTime / timelineEnd;
-    const endFrac = r.responseEnd / timelineEnd;
-    const barStart = Math.round(startFrac * barWidth);
-    const barLen = Math.max(1, Math.round((endFrac - startFrac) * barWidth));
-
-    const bar = ' '.repeat(barStart) + CYAN + '█'.repeat(barLen) + RESET + ' '.repeat(Math.max(0, barWidth - barStart - barLen));
+    const phases = computeResourcePhases(r);
+    let bar;
+    if (phases.length > 0) {
+      const chars = new Array(barWidth).fill(' ');
+      const colors = new Array(barWidth).fill('');
+      for (const p of phases) {
+        const pStart = Math.round((p.start / timelineEnd) * barWidth);
+        const pLen = Math.max(1, Math.round((p.duration / timelineEnd) * barWidth));
+        const ansi = PHASE_ANSI_COLORS[p.color] || CYAN;
+        for (let i = pStart; i < Math.min(pStart + pLen, barWidth); i++) {
+          chars[i] = '█';
+          colors[i] = ansi;
+        }
+      }
+      bar = '';
+      let currentColor = '';
+      for (let i = 0; i < barWidth; i++) {
+        if (chars[i] === '█') {
+          if (colors[i] !== currentColor) {
+            bar += colors[i];
+            currentColor = colors[i];
+          }
+          bar += '█';
+        } else {
+          if (currentColor !== '') {
+            bar += RESET;
+            currentColor = '';
+          }
+          bar += ' ';
+        }
+      }
+      if (currentColor !== '') bar += RESET;
+    } else {
+      const startFrac = r.startTime / timelineEnd;
+      const endFrac = r.responseEnd / timelineEnd;
+      const barStart = Math.round(startFrac * barWidth);
+      const barLen = Math.max(1, Math.round((endFrac - startFrac) * barWidth));
+      bar = ' '.repeat(barStart) + CYAN + '█'.repeat(barLen) + RESET + ' '.repeat(Math.max(0, barWidth - barStart - barLen));
+    }
 
     console.log(
       `  ${truncUrl(r.name, 40).padEnd(42)} ${fmtMs(r.startTime).padStart(7)} ${fmtMs(r.duration).padStart(7)}  ${bar}`,

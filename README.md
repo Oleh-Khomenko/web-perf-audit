@@ -18,8 +18,20 @@ Zero-dependency Chrome CDP performance auditor. Launches headless Chrome, collec
 
 ## Requirements
 
-- Node.js >= 18
-- Google Chrome, Chromium, or Brave Browser installed
+- **Node.js** >= 18
+- **Chromium-based browser** installed — Google Chrome, Chromium, Brave, Microsoft Edge, or any other Chromium-based browser
+
+### Supported platforms
+
+| Platform | Browser discovery |
+|---|---|
+| **macOS** | Google Chrome, Chromium, Chrome Canary, Brave (standard `/Applications` paths) |
+| **Linux** | `google-chrome`, `google-chrome-stable`, `chromium-browser`, `chromium` (resolved via `$PATH`) |
+| **Windows** | `C:\Program Files\Google\Chrome\Application\chrome.exe`, `C:\Program Files (x86)\...\chrome.exe` |
+
+The tool auto-detects the browser by trying known paths in order. If your browser is installed in a non-standard location, ensure it is available in your system `$PATH`.
+
+> **Note:** Firefox and Safari are **not supported** — the tool communicates with the browser via Chrome DevTools Protocol (CDP), which is only available in Chromium-based browsers. Some features (Long Animation Frames API for TBT attribution) require **Chrome 123+**.
 
 ## Installation
 

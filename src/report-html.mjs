@@ -2,7 +2,7 @@
  * HTML report generation — self-contained HTML with inline CSS.
  */
 
-import { fmtMs, fmtBytes, truncUrl, rate, computeScore, computeOverallScore, METRIC_SCORING, computeFcpPhases, computeLcpPhases, buildClsSessionWindows, computeInpPhases } from './format.mjs';
+import { fmtMs, fmtBytes, truncUrl, rate, computeScore, computeOverallScore, METRIC_SCORING, computeFcpPhases, computeLcpPhases, buildClsSessionWindows, computeInpPhases, computeResourcePhases } from './format.mjs';
 
 const CSS_COLORS = { green: '#16a34a', yellow: '#ca8a04', red: '#dc2626' };
 
@@ -117,6 +117,10 @@ export function generateHtml(data, meta) {
   .waterfall-legend-dot { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
   .waterfall-track { flex: 1; height: 16px; background: #f1f5f9; border-radius: 3px; position: relative; }
   .waterfall-bar { position: absolute; height: 100%; background: #3b82f6; border-radius: 3px; min-width: 2px; }
+  .waterfall-seg { position: absolute; height: 100%; min-width: 1px; }
+  .waterfall-seg:first-child { border-radius: 3px 0 0 3px; }
+  .waterfall-seg:last-child { border-radius: 0 3px 3px 0; }
+  .waterfall-seg:only-child { border-radius: 3px; }
   .tag-good { color: #16a34a; }
   .tag-warn { color: #ca8a04; }
   .tag-poor { color: #dc2626; }
@@ -648,9 +652,13 @@ ${largest.map(r => `    <tr><td class="url-cell mono">${urlWithTooltip(r.name, 5
 
 <h2>Initial Waterfall</h2>
 <div class="waterfall-legend">
-  <span><span class="waterfall-legend-dot" style="background:#16a34a"></span> Document</span>
-  <span><span class="waterfall-legend-dot" style="background:#3b82f6"></span> Resource</span>
-  <span><span class="waterfall-legend-dot" style="background:#dc2626"></span> Render-blocking</span>
+  <span><span class="waterfall-legend-dot" style="background:#94a3b8"></span> Queueing</span>
+  <span><span class="waterfall-legend-dot" style="background:#fb923c"></span> Stalled</span>
+  <span><span class="waterfall-legend-dot" style="background:#8b5cf6"></span> DNS</span>
+  <span><span class="waterfall-legend-dot" style="background:#3b82f6"></span> TCP</span>
+  <span><span class="waterfall-legend-dot" style="background:#06b6d4"></span> TLS</span>
+  <span><span class="waterfall-legend-dot" style="background:#22c55e"></span> Waiting (TTFB)</span>
+  <span><span class="waterfall-legend-dot" style="background:#60a5fa"></span> Content Download</span>
 </div>
 <div style="margin-bottom:1rem">
 ${(() => {
@@ -661,19 +669,22 @@ ${(() => {
     const navRow = `  <div class="waterfall-row">
     <span class="waterfall-label">${urlWithTooltip(nav.name, 35)}</span>
     <span class="waterfall-times">document · ${fmtMs(0)} / ${fmtMs(navDuration)}</span>
-    <div class="waterfall-track"><div class="waterfall-bar" style="left:${navStartPct}%;width:${navWidthPct}%;background:#16a34a"></div></div>
+    <div class="waterfall-track"><div class="waterfall-bar" style="left:${navStartPct}%;width:${navWidthPct}%;background:#16a34a" title="Document: ${fmtMs(navDuration)}"></div></div>
   </div>`;
 
     const criticalTypes = new Set(['link', 'css', 'script']);
     const resourceRows = [...resourceEntries].filter(r => criticalTypes.has(r.initiatorType)).sort((a, b) => a.startTime - b.startTime).slice(0, 30).map(r => {
-      const startPct = (r.startTime / timelineEnd * 100).toFixed(2);
-      const widthPct = Math.max(0.5, (r.duration / timelineEnd * 100)).toFixed(2);
-      const isBlocking = r.renderBlockingStatus === 'blocking';
-      const barBg = isBlocking ? '#dc2626' : '#3b82f6';
+      const phases = computeResourcePhases(r);
+      const segments = phases.length > 0 ? phases.map(p => {
+        const left = (p.start / timelineEnd * 100).toFixed(2);
+        const width = Math.max(0.1, (p.duration / timelineEnd * 100)).toFixed(2);
+        return `<div class="waterfall-seg" style="left:${left}%;width:${width}%;background:${p.color}" title="${escHtml(p.name)}: ${fmtMs(p.duration)}"></div>`;
+      }).join('') : `<div class="waterfall-bar" style="left:${(r.startTime / timelineEnd * 100).toFixed(2)}%;width:${Math.max(0.5, (r.duration / timelineEnd * 100)).toFixed(2)}%;background:${r.renderBlockingStatus === 'blocking' ? '#dc2626' : '#3b82f6'}"></div>`;
+      const blockTag = r.renderBlockingStatus === 'blocking' ? ' <span style="color:#dc2626;font-weight:600">[RB]</span>' : '';
       return `  <div class="waterfall-row">
     <span class="waterfall-label">${urlWithTooltip(r.name, 35)}</span>
-    <span class="waterfall-times">${escHtml(r.initiatorType || '')} · ${fmtMs(r.startTime)} / ${fmtMs(r.duration)}</span>
-    <div class="waterfall-track"><div class="waterfall-bar" style="left:${startPct}%;width:${widthPct}%;background:${barBg}"></div></div>
+    <span class="waterfall-times">${escHtml(r.initiatorType || '')} · ${fmtMs(r.startTime)} / ${fmtMs(r.duration)}${blockTag}</span>
+    <div class="waterfall-track">${segments}</div>
   </div>`;
     });
 
@@ -684,12 +695,16 @@ ${(() => {
 <h2>Network Waterfall (Top 20 Slowest)</h2>
 <div style="margin-bottom:1rem">
 ${slowest.map(r => {
-    const startPct = (r.startTime / timelineEnd * 100).toFixed(2);
-    const widthPct = Math.max(0.5, (r.duration / timelineEnd * 100)).toFixed(2);
+    const phases = computeResourcePhases(r);
+    const segments = phases.length > 0 ? phases.map(p => {
+      const left = (p.start / timelineEnd * 100).toFixed(2);
+      const width = Math.max(0.1, (p.duration / timelineEnd * 100)).toFixed(2);
+      return `<div class="waterfall-seg" style="left:${left}%;width:${width}%;background:${p.color}" title="${escHtml(p.name)}: ${fmtMs(p.duration)}"></div>`;
+    }).join('') : `<div class="waterfall-bar" style="left:${(r.startTime / timelineEnd * 100).toFixed(2)}%;width:${Math.max(0.5, (r.duration / timelineEnd * 100)).toFixed(2)}%"></div>`;
     return `  <div class="waterfall-row">
     <span class="waterfall-label">${urlWithTooltip(r.name, 35)}</span>
     <span class="waterfall-times">${fmtMs(r.startTime)} / ${fmtMs(r.duration)}</span>
-    <div class="waterfall-track"><div class="waterfall-bar" style="left:${startPct}%;width:${widthPct}%"></div></div>
+    <div class="waterfall-track">${segments}</div>
   </div>`;
   }).join('\n')}
 </div>

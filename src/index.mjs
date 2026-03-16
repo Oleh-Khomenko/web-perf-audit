@@ -11,7 +11,7 @@
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 
 import { CDPSession, httpJson } from './cdp.mjs';
 import { runAudit } from './audit.mjs';
@@ -97,6 +97,9 @@ if (args.includes('--help') || args.includes('-h')) {
     Largest Resources    Top 10 resources by transfer size
     Network Waterfall    ASCII timeline of the 20 slowest resources
 
+  Environment variables:
+    CHROME_PATH              Path to a custom Chrome/Chromium binary
+
   Examples:
     web-perf-audit
     web-perf-audit https://example.com
@@ -168,21 +171,76 @@ for (let i = 0; i < args.length; i++) {
 
 // -- Chrome discovery --
 
-const CHROME_PATHS = [
-  // macOS
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  '/Applications/Chromium.app/Contents/MacOS/Chromium',
-  '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
-  '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-  // Linux
-  'google-chrome',
-  'google-chrome-stable',
-  'chromium-browser',
-  'chromium',
-  // Windows
-  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-];
+const CHROME_PATHS_BY_PLATFORM = {
+  darwin: [
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+  ],
+  linux: [
+    'google-chrome',
+    'google-chrome-stable',
+    'chromium-browser',
+    'chromium',
+  ],
+  win32: [
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ],
+};
+
+/**
+ * Try to spawn a bare command name (e.g. 'google-chrome') and resolve
+ * with the ChildProcess on success, or reject on error.
+ */
+function trySpawn(cmd, args, opts) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, opts);
+    proc.on('spawn', () => resolve(proc));
+    proc.on('error', (err) => reject(err));
+  });
+}
+
+/**
+ * Find a working Chrome binary. Checks CHROME_PATH env var first,
+ * then platform-specific candidates.
+ */
+async function findChrome(chromeArgs, spawnOpts) {
+  // 1. Check CHROME_PATH env var
+  if (process.env.CHROME_PATH) {
+    const p = process.env.CHROME_PATH;
+    if (!existsSync(p)) {
+      console.error(`CHROME_PATH is set to "${p}" but the file does not exist.`);
+      process.exit(1);
+    }
+    return trySpawn(p, chromeArgs, spawnOpts);
+  }
+
+  // 2. Get platform-specific candidates (fall back to all paths if platform unknown)
+  const candidates = CHROME_PATHS_BY_PLATFORM[process.platform] ||
+    Object.values(CHROME_PATHS_BY_PLATFORM).flat();
+
+  for (const p of candidates) {
+    const isAbsolute = p.startsWith('/') || /^[a-zA-Z]:\\/.test(p);
+
+    if (isAbsolute) {
+      // For absolute paths, check existence first to avoid ENOENT
+      if (existsSync(p)) {
+        return trySpawn(p, chromeArgs, spawnOpts);
+      }
+    } else {
+      // For bare command names (linux), try spawning and await result
+      try {
+        return await trySpawn(p, chromeArgs, spawnOpts);
+      } catch {
+        // not found, try next
+      }
+    }
+  }
+
+  return null;
+}
 
 // -- Main --
 
@@ -191,26 +249,23 @@ async function main() {
   const debugPort = 9222 + Math.floor(Math.random() * 1000);
 
   // Launch Chrome
-  let chromeProc;
-  for (const p of CHROME_PATHS) {
-    try {
-      chromeProc = spawn(p, [
-        '--headless=new',
-        `--remote-debugging-port=${debugPort}`,
-        `--user-data-dir=${userDataDir}`,
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-extensions',
-        '--disable-gpu',
-        'about:blank',
-      ], { stdio: 'ignore' });
-      break;
-    }
-    catch { /* try next */ }
-  }
+  const chromeArgs = [
+    '--headless=new',
+    `--remote-debugging-port=${debugPort}`,
+    `--user-data-dir=${userDataDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-extensions',
+    '--disable-gpu',
+    'about:blank',
+  ];
+  const chromeProc = await findChrome(chromeArgs, { stdio: 'ignore' });
 
   if (!chromeProc) {
-    console.error('Could not find Chrome. Looked in:\n' + CHROME_PATHS.join('\n'));
+    const candidates = CHROME_PATHS_BY_PLATFORM[process.platform] ||
+      Object.values(CHROME_PATHS_BY_PLATFORM).flat();
+    console.error('Could not find Chrome. Looked in:\n' + candidates.join('\n'));
+    console.error('\nYou can set the CHROME_PATH environment variable to your Chrome binary.');
     process.exit(1);
   }
 

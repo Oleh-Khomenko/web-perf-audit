@@ -39,16 +39,16 @@ export function rate(value, good, poor) {
  */
 export function computeScore(value, p10, median) {
   if (value <= 0) return 1;
-  const INVERSE_ERF_50 = 0.4769362762044699; // erfinv(0.5)
+  const ERFINV_0_8 = 0.9061938024368232;
   const mu = Math.log(median);
-  const sigma = (Math.log(median) - Math.log(p10)) / (INVERSE_ERF_50 * Math.SQRT2);
+  const sigma = (Math.log(median) - Math.log(p10)) / (ERFINV_0_8 * Math.SQRT2);
   if (sigma <= 0) return value <= median ? 1 : 0;
-  // Standard normal CDF via approximation (Abramowitz & Stegun)
-  const z = (Math.log(value) - mu) / sigma;
-  const t = 1 / (1 + 0.3275911 * Math.abs(z));
+  const u = (Math.log(value) - mu) / (sigma * Math.SQRT2);
+  const x = Math.abs(u);
+  const t = 1 / (1 + 0.3275911 * x);
   const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-  const cdf = 1 - poly * Math.exp(-z * z / 2);
-  return 1 - (z >= 0 ? cdf : 1 - cdf);
+  const erfc = poly * Math.exp(-x * x);
+  return u >= 0 ? erfc / 2 : 1 - erfc / 2;
 }
 
 /**
@@ -379,6 +379,90 @@ export function computeInpPhases(inpEntries, longTaskDetails = []) {
     })),
   };
 }
+
+/**
+ * Computes timing phase segments for a resource entry (Chrome DevTools style).
+ * Returns array of { name, start, duration, color }.
+ */
+export function computeResourcePhases(r) {
+  const phases = [];
+  const startTime = r.startTime || 0;
+  const fetchStart = r.fetchStart || startTime;
+  const domainLookupStart = r.domainLookupStart || 0;
+  const domainLookupEnd = r.domainLookupEnd || 0;
+  const connectStart = r.connectStart || 0;
+  const connectEnd = r.connectEnd || 0;
+  const secureConnectionStart = r.secureConnectionStart || 0;
+  const requestStart = r.requestStart || 0;
+  const responseStart = r.responseStart || 0;
+  const responseEnd = r.responseEnd || 0;
+
+  // Queueing: startTime → fetchStart
+  const queueing = fetchStart - startTime;
+  if (queueing >= 0.5) {
+    phases.push({ name: 'Queueing', start: startTime, duration: queueing, color: '#94a3b8' });
+  }
+
+  // Stalled: fetchStart → domainLookupStart (or connectStart if no DNS)
+  const stalledEnd = domainLookupStart > fetchStart ? domainLookupStart : connectStart > fetchStart ? connectStart : requestStart > fetchStart ? requestStart : fetchStart;
+  const stalled = stalledEnd - fetchStart;
+  if (stalled >= 0.5) {
+    phases.push({ name: 'Stalled', start: fetchStart, duration: stalled, color: '#fb923c' });
+  }
+
+  // DNS Lookup
+  const dns = domainLookupEnd - domainLookupStart;
+  if (dns >= 0.5) {
+    phases.push({ name: 'DNS Lookup', start: domainLookupStart, duration: dns, color: '#8b5cf6' });
+  }
+
+  // TCP + TLS
+  if (connectEnd > connectStart && (connectEnd - connectStart) >= 0.5) {
+    if (secureConnectionStart > 0 && secureConnectionStart >= connectStart) {
+      // TCP portion
+      const tcp = secureConnectionStart - connectStart;
+      if (tcp >= 0.5) {
+        phases.push({ name: 'TCP', start: connectStart, duration: tcp, color: '#3b82f6' });
+      }
+      // TLS portion
+      const tls = connectEnd - secureConnectionStart;
+      if (tls >= 0.5) {
+        phases.push({ name: 'TLS', start: secureConnectionStart, duration: tls, color: '#06b6d4' });
+      }
+    } else {
+      // No TLS, entire connect is TCP
+      const tcp = connectEnd - connectStart;
+      if (tcp >= 0.5) {
+        phases.push({ name: 'TCP', start: connectStart, duration: tcp, color: '#3b82f6' });
+      }
+    }
+  }
+
+  // Waiting (TTFB): requestStart → responseStart
+  const waiting = responseStart - requestStart;
+  if (waiting >= 0.5) {
+    phases.push({ name: 'Waiting (TTFB)', start: requestStart, duration: waiting, color: '#22c55e' });
+  }
+
+  // Content Download: responseStart → responseEnd
+  const download = responseEnd - responseStart;
+  if (download >= 0.5) {
+    phases.push({ name: 'Content Download', start: responseStart, duration: download, color: '#60a5fa' });
+  }
+
+  return phases;
+}
+
+// Phase color → ANSI code mapping for console output
+export const PHASE_ANSI_COLORS = {
+  '#94a3b8': '\x1b[90m',  // gray - Queueing
+  '#fb923c': '\x1b[33m',  // yellow/orange - Stalled
+  '#8b5cf6': '\x1b[35m',  // magenta - DNS
+  '#3b82f6': '\x1b[34m',  // blue - TCP
+  '#06b6d4': '\x1b[36m',  // cyan - TLS
+  '#22c55e': '\x1b[32m',  // green - Waiting
+  '#60a5fa': '\x1b[94m',  // light blue - Content Download
+};
 
 export function median(arr) {
   if (arr.length === 0) return 0;
