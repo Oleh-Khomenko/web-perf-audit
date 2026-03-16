@@ -3,10 +3,12 @@
  */
 
 export function fmtMs(ms) {
+  if (ms == null || !isFinite(ms)) return '—';
   return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${Math.round(ms)}ms`;
 }
 
 export function fmtBytes(bytes) {
+  if (bytes == null || !isFinite(bytes)) return '—';
   if (bytes > 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
   if (bytes > 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   return `${bytes}B`;

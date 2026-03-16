@@ -1,6 +1,6 @@
 {
   "name": "web-perf-audit",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Zero-dependency Chrome CDP performance auditor — Web Vitals, Navigation Timing, JS Coverage, resource waterfall, and HTML reports",
   "type": "module",
   "bin": {

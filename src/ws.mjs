@@ -48,7 +48,8 @@ export class MinimalWebSocket extends EventEmitter {
       if (idx === -1) return;
 
       const header = this._buffer.subarray(0, idx).toString();
-      if (!header.includes('101')) {
+      const statusLine = header.split('\r\n')[0];
+      if (!statusLine.includes('101')) {
         this._emit('error', new Error(`WebSocket upgrade failed: ${header.split('\r\n')[0]}`));
         this._socket.destroy();
         return;
@@ -56,6 +57,9 @@ export class MinimalWebSocket extends EventEmitter {
       this._opened = true;
       this._buffer = this._buffer.subarray(idx + 4);
       this._emit('open');
+      // Defer frame parsing so 'open' listeners settle before 'message' fires
+      if (this._buffer.length > 0) queueMicrotask(() => this._parseFrames());
+      return;
     }
 
     // Parse frames
@@ -97,6 +101,7 @@ export class MinimalWebSocket extends EventEmitter {
       if (opcode === OPCODES.TEXT) {
         this._emit('message', { data: payload.toString('utf-8') });
       } else if (opcode === OPCODES.CLOSE) {
+        this._sendFrame(OPCODES.CLOSE, payload);
         this._socket.end();
       } else if (opcode === OPCODES.PING) {
         this._sendFrame(OPCODES.PONG, payload);
@@ -109,6 +114,7 @@ export class MinimalWebSocket extends EventEmitter {
   }
 
   _sendFrame(opcode, payload) {
+    if (!this._socket || this._socket.destroyed) return;
     const mask = randomBytes(4);
     let header;
 
@@ -138,6 +144,7 @@ export class MinimalWebSocket extends EventEmitter {
   }
 
   close() {
+    if (!this._socket || this._socket.destroyed) return;
     this._sendFrame(OPCODES.CLOSE, Buffer.alloc(0));
     this._socket.end();
   }

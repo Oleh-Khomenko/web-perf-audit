@@ -16,7 +16,7 @@ export const CYAN = '\x1b[36m';
 const ANSI_COLORS = { green: GREEN, yellow: YELLOW, red: RED };
 
 function printMetric(name, value, unit, good, poor, explanation) {
-  const display = unit === 'ms' ? fmtMs(value) : value.toFixed(3);
+  const display = unit === 'ms' ? fmtMs(value) : (value ?? 0).toFixed(3);
   const { label, color } = rate(value, good, poor);
   const ansi = ANSI_COLORS[color];
   const nameStr = name.padEnd(28);
@@ -233,8 +233,8 @@ export function printReport(data, meta = {}) {
   // -- CLS Breakdown --
   console.log(`${BOLD}── CLS Breakdown ──${RESET}\n`);
 
-  if (vitals.cls < 0.001) {
-    console.log(`  ${DIM}CLS is near-zero (${vitals.cls.toFixed(4)}) — no breakdown to show.${RESET}`);
+  if (!vitals.cls || vitals.cls < 0.001) {
+    console.log(`  ${DIM}CLS is near-zero (${(vitals.cls ?? 0).toFixed(4)}) — no breakdown to show.${RESET}`);
   }
   else {
     const windows = buildClsSessionWindows(clsEntries);
@@ -479,7 +479,7 @@ export function printReport(data, meta = {}) {
     .filter(r => criticalTypes.has(r.initiatorType))
     .sort((a, b) => a.startTime - b.startTime)
     .slice(0, 30);
-  const waterfallEnd = Math.max(...resourceEntries.map(r => r.responseEnd), 1);
+  const waterfallEnd = resourceEntries.reduce((max, r) => r.responseEnd > max ? r.responseEnd : max, 1);
   const wfBarWidth = 40;
 
   console.log(`  ${'Resource'.padEnd(36)} ${'Type'.padEnd(8)} ${'Start'.padStart(7)} ${'Dur'.padStart(7)}  ${''.padEnd(wfBarWidth)}`);

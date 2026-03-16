@@ -2,6 +2,11 @@
  * CDP data collection logic — runs a single performance audit.
  */
 
+function safeJsonParse(value, fallback = null) {
+  try { return JSON.parse(value); }
+  catch { return fallback; }
+}
+
 export async function runAudit(cdp, targetUrl, options = {}) {
   // Enable domains
   await cdp.send('Page.enable');
@@ -185,8 +190,9 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     `,
   });
 
-  // Clear caches, cookies, and storage before navigation
-  await cdp.send('Network.clearBrowserCookies');
+  // Clear caches and storage before navigation
+  // Note: cookies are not cleared globally — each run uses a fresh browser context
+  // which already has no cookies. Clearing globally would break parallel runs with --cookie.
   await cdp.send('Network.clearBrowserCache');
   const origin = new URL(targetUrl).origin;
   await cdp.send('Storage.clearDataForOrigin', { origin, storageTypes: 'all' });
@@ -229,7 +235,9 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     await cdp.send('Emulation.setCPUThrottlingRate', { rate: options.cpuThrottle });
   }
 
-  // Navigate
+  // Navigate — wrap the rest in try/finally to ensure profiler cleanup
+  let _profilerStarted = true;
+  try {
   const navPromise = new Promise((resolve) => {
     cdp.on('Page.loadEventFired', () => resolve());
   });
@@ -238,7 +246,15 @@ export async function runAudit(cdp, targetUrl, options = {}) {
   if (navResponse.errorText) {
     throw new Error(`Navigation to ${targetUrl} failed: ${navResponse.errorText}`);
   }
-  await navPromise;
+  let navTimer;
+  const navTimeout = new Promise((_, reject) =>
+    navTimer = setTimeout(() => reject(new Error('Page load timed out after 30s')), 30000)
+  );
+  try {
+    await Promise.race([navPromise, navTimeout]);
+  } finally {
+    clearTimeout(navTimer);
+  }
 
   // Wait for LCP and layout shifts to settle
   await new Promise((r) => setTimeout(r, 3000));
@@ -261,7 +277,7 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     returnByValue: false,
   });
 
-  const interactiveEl = JSON.parse(interactiveResult.value);
+  const interactiveEl = safeJsonParse(interactiveResult.value);
   if (interactiveEl) {
     await cdp.send('Input.dispatchMouseEvent', {
       type: 'mousePressed', x: interactiveEl.x, y: interactiveEl.y, button: 'left', clickCount: 1,
@@ -289,14 +305,14 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     } : null)`,
     returnByValue: false,
   });
-  const connectionInfo = JSON.parse(connResult.value);
+  const connectionInfo = safeJsonParse(connResult.value);
 
   // Navigation timing
   const { result: navResult } = await cdp.send('Runtime.evaluate', {
     expression: 'JSON.stringify(performance.getEntriesByType("navigation")[0].toJSON())',
     returnByValue: false,
   });
-  const nav = JSON.parse(navResult.value);
+  const nav = safeJsonParse(navResult.value, {});
 
   // Server-Timing headers (toJSON() strips serverTiming array)
   const { result: serverTimingResult } = await cdp.send('Runtime.evaluate', {
@@ -307,14 +323,18 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     })))`,
     returnByValue: false,
   });
-  const serverTiming = JSON.parse(serverTimingResult.value);
+  const serverTiming = safeJsonParse(serverTimingResult.value);
 
   // Web vitals
   const { result: vitalsResult } = await cdp.send('Runtime.evaluate', {
     expression: 'JSON.stringify(window.__perfData)',
     returnByValue: false,
   });
-  const vitals = JSON.parse(vitalsResult.value);
+  const vitals = safeJsonParse(vitalsResult.value, {});
+  if (!vitals.longTasks) vitals.longTasks = [];
+  if (!vitals.inpEntries) vitals.inpEntries = [];
+  if (!vitals.renderBlocking) vitals.renderBlocking = [];
+  if (!vitals.clsEntries) vitals.clsEntries = [];
   const tbt = vitals.longTasks.reduce((sum, lt) => sum + lt.blockingTime, 0);
 
   // Aggregate long tasks by script URL (fall back to invoker for grouping)
@@ -352,7 +372,7 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     })))`,
     returnByValue: false,
   });
-  const resourceEntries = JSON.parse(resEntriesResult.value);
+  const resourceEntries = safeJsonParse(resEntriesResult.value, []);
 
   // Resource summary (aggregated)
   const resourceSummary = {};
@@ -366,6 +386,7 @@ export async function runAudit(cdp, targetUrl, options = {}) {
 
   // CPU profile (per-script execution time)
   const { profile } = await cdp.send('Profiler.stop');
+  _profilerStarted = false;
 
   const nodeMap = new Map();
   for (const node of profile.nodes) {
@@ -413,7 +434,7 @@ export async function runAudit(cdp, targetUrl, options = {}) {
 
     const total = entry.source ? entry.source.length : 0;
     // If source not available, estimate from max end offset
-    const estimatedTotal = total || Math.max(...allRanges.map(r => r[1]), 0);
+    const estimatedTotal = total || allRanges.reduce((max, r) => r[1] > max ? r[1] : max, 0);
     used = Math.min(used, estimatedTotal);
     const unused = estimatedTotal - used;
     // Execution time in ms (from CPU profile, microseconds → ms)
@@ -463,7 +484,7 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     })))`,
     returnByValue: false,
   });
-  const preloadLinks = JSON.parse(preloadResult.value);
+  const preloadLinks = safeJsonParse(preloadResult.value);
 
   // Rendering metrics from CDP Performance domain
   const { metrics: perfMetrics } = await cdp.send('Performance.getMetrics');
@@ -512,4 +533,16 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     renderMetrics,
     memoryInfo,
   };
+
+  } finally {
+    // Clean up profiler/throttle if we exited early (timeout, error)
+    if (_profilerStarted) {
+      try { await cdp.send('Profiler.stop'); } catch {}
+      try { await cdp.send('Profiler.stopPreciseCoverage'); } catch {}
+      try { await cdp.send('Profiler.disable'); } catch {}
+      if (options.cpuThrottle && options.cpuThrottle > 1) {
+        try { await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 }); } catch {}
+      }
+    }
+  }
 }

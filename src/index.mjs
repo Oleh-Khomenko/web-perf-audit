@@ -197,6 +197,10 @@ for (let i = 0; i < args.length; i++) {
   }
 }
 
+// -- Validate URL early --
+try { new URL(TARGET_URL); }
+catch { console.error(`Invalid URL: "${TARGET_URL}"`); process.exit(1); }
+
 // -- Chrome discovery --
 
 const CHROME_PATHS_BY_PLATFORM = {
@@ -297,11 +301,15 @@ async function main() {
     process.exit(1);
   }
 
+  try {
   // Wait for CDP to be ready
   let wsUrl;
   for (let i = 0; i < 50; i++) {
+    if (chromeProc.exitCode !== null) {
+      throw new Error(`Chrome exited with code ${chromeProc.exitCode} before CDP was ready`);
+    }
     try {
-      const info = await httpJson(`http://127.0.0.1:${debugPort}/json/version`);
+      const info = await httpJson(`http://127.0.0.1:${debugPort}/json/version`, 'GET', 500);
       wsUrl = info.webSocketDebuggerUrl;
       break;
     }
@@ -311,11 +319,8 @@ async function main() {
   }
 
   if (!wsUrl) {
-    console.error('Chrome started but CDP not reachable.');
-    chromeProc.kill();
-    process.exit(1);
+    throw new Error('Chrome started but CDP not reachable.');
   }
-
   console.log(`\n${BOLD}Performance Audit: ${TARGET_URL}${RESET}`);
   console.log(`${DIM}Device: ${DEVICE.label} (${DEVICE.width}x${DEVICE.height}${DEVICE.mobile ? ', touch' : ''})${RESET}`);
   if (THROTTLE) console.log(`${DIM}Network: ${THROTTLE.label} (latency ${THROTTLE.latency}ms, down ${THROTTLE.downloadThroughput / 1024} KB/s, up ${THROTTLE.uploadThroughput / 1024} KB/s)${RESET}`);
@@ -324,7 +329,8 @@ async function main() {
   console.log();
 
   // Browser-level CDP session for creating isolated contexts
-  const browser = new CDPSession(wsUrl);
+  let browser;
+  browser = new CDPSession(wsUrl);
   await browser.connect();
 
   // Close the default about:blank page from Chrome launch
@@ -345,39 +351,43 @@ async function main() {
     // Create an isolated browser context (incognito-like) per run
     // This gives a fresh DNS cache, connection pool, cookies, and storage
     const { browserContextId } = await browser.send('Target.createBrowserContext');
-    const { targetId } = await browser.send('Target.createTarget', {
-      url: 'about:blank',
-      browserContextId,
-    });
+    try {
+      const { targetId } = await browser.send('Target.createTarget', {
+        url: 'about:blank',
+        browserContextId,
+      });
 
-    // Find the page WebSocket URL for the new target
-    const targets = await httpJson(`http://127.0.0.1:${debugPort}/json`);
-    const pageTarget = targets.find((t) => t.id === targetId);
-    if (!pageTarget) throw new Error('Could not find page target for isolated context');
+      // Construct the WS URL directly to avoid a race with the /json HTTP endpoint
+      const cdp = new CDPSession(`ws://127.0.0.1:${debugPort}/devtools/page/${targetId}`);
+      await cdp.connect();
+      try {
+        const result = await runAudit(cdp, TARGET_URL, auditOpts);
 
-    const cdp = new CDPSession(pageTarget.webSocketDebuggerUrl);
-    await cdp.connect();
+        if (NUM_RUNS > 1) {
+          const r = result;
+          console.log(`  ${DIM}[Run ${runIndex + 1}]${RESET} TTFB: ${fmtMs(r.nav.responseStart - r.nav.startTime)} | FCP: ${fmtMs(r.vitals.fcp)} | LCP: ${fmtMs(r.vitals.lcp)} | CLS: ${r.vitals.cls.toFixed(3)} | TBT: ${fmtMs(r.tbt)}`);
+        }
 
-    const result = await runAudit(cdp, TARGET_URL, auditOpts);
-
-    cdp.close();
-    await browser.send('Target.disposeBrowserContext', { browserContextId });
-
-    if (NUM_RUNS > 1) {
-      const r = result;
-      console.log(`  ${DIM}[Run ${runIndex + 1}]${RESET} TTFB: ${fmtMs(r.nav.responseStart - r.nav.startTime)} | FCP: ${fmtMs(r.vitals.fcp)} | LCP: ${fmtMs(r.vitals.lcp)} | CLS: ${r.vitals.cls.toFixed(3)} | TBT: ${fmtMs(r.tbt)}`);
+        return result;
+      } finally {
+        cdp.close();
+      }
+    } finally {
+      await browser.send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
     }
-
-    return result;
   }
 
   let allResults;
 
   if (PARALLEL && NUM_RUNS > 1) {
-    // Run all iterations concurrently
-    allResults = await Promise.all(
+    // Run all iterations concurrently; collect partial results on failure
+    const settled = await Promise.allSettled(
       Array.from({ length: NUM_RUNS }, (_, i) => executeRun(i)),
     );
+    const failures = settled.filter(r => r.status === 'rejected');
+    for (const f of failures) console.error(`  Run failed: ${f.reason.message}`);
+    allResults = settled.filter(r => r.status === 'fulfilled').map(r => r.value);
+    if (allResults.length === 0) throw new Error('All runs failed');
   }
   else {
     // Run sequentially
@@ -389,6 +399,7 @@ async function main() {
   }
 
   browser.close();
+  browser = null;
 
   console.log();
 
@@ -474,9 +485,11 @@ async function main() {
     console.log(`${BOLD}HTML report saved: ${htmlPath}${RESET}\n`);
   }
 
-  // Cleanup
-  chromeProc.kill();
-  try { rmSync(userDataDir, { recursive: true, force: true }); } catch { /* ok */ }
+  } finally {
+    try { if (browser) browser.close(); } catch { /* ok */ }
+    chromeProc.kill();
+    try { rmSync(userDataDir, { recursive: true, force: true }); } catch { /* ok */ }
+  }
 }
 
 main().catch((err) => {

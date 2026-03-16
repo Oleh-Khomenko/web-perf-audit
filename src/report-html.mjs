@@ -10,6 +10,54 @@ function escHtml(str) {
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+const PHASE_DESCRIPTIONS = {
+  // TTFB phases
+  'Redirect': 'Time spent following HTTP redirects (3xx) before the final request begins.',
+  'Unload': 'Time for the browser to unload the previous page before starting the fetch.',
+  'Service Worker': 'Time spent in the Service Worker processing the request (if registered).',
+  'Queue / Stale Check': 'Time between fetchStart and DNS lookup — includes HTTP cache checks and connection queueing.',
+  'DNS Lookup': 'Time to resolve the domain name to an IP address via DNS.',
+  'TCP Connection': 'Time to establish the TCP connection (SYN → SYN-ACK → ACK handshake).',
+  'TLS Negotiation': 'Time for the TLS/SSL handshake after the TCP connection is established.',
+  'Request → Response': 'Time from sending the HTTP request to receiving the first byte of the response (server processing time).',
+  'Server Response (TTFB)': 'Time from sending the HTTP request to receiving the first byte of the response.',
+  'Content Download': 'Time to download the full HTML response body after the first byte arrives.',
+  'DOM Interactive': 'Time from response end until the DOM is fully parsed and interactive (scripts have executed).',
+  'DOM Content Loaded': 'Time from response end until DOMContentLoaded fires — DOM is ready, deferred scripts have run.',
+  'DOM Complete': 'Time from response end until all sub-resources (images, stylesheets, etc.) have finished loading.',
+  'Load Event Duration': 'Time spent executing load event handlers (window.onload callbacks).',
+  'Total Page Load': 'Total time from navigation start to the load event completing.',
+  'Other': 'Unaccounted time gap between measured phases.',
+  // FCP phases
+  'TTFB': 'Time to First Byte — time until the browser receives the first byte of the HTML response.',
+  'Blocking Resources': 'Time spent waiting for render-blocking CSS and synchronous JS to download and execute before painting can start.',
+  'HTML Parse': 'Time for the browser to parse the HTML document and build the DOM tree.',
+  'Style & Font Load': 'Time waiting for stylesheets and web fonts needed for the first contentful paint.',
+  'Render Setup': 'Time for style calculation, layout, and compositing before the first pixels are painted.',
+  // LCP phases
+  'LCP Resource Delay': 'Time between TTFB and the browser starting to fetch the LCP resource (e.g. image). Indicates discovery delay — consider preloading.',
+  'LCP Resource Download': 'Time to download the LCP resource (image, video, etc.). Optimize file size or use a CDN.',
+  'DOM Wait': 'Time waiting for DOM construction before the LCP element can be rendered.',
+  'Stylesheet Wait': 'Time waiting for critical stylesheets that block rendering of the LCP element.',
+  'Font Wait': 'Time waiting for web fonts required to render the LCP text element.',
+  'Long Tasks (JS)': 'Time the main thread was blocked by long JavaScript tasks, delaying LCP rendering.',
+  'Render Work': 'Time for style recalculation, layout, and paint needed to render the LCP element.',
+  'Element Render Delay': 'Time between resource load completion and the element actually being rendered — may indicate lazy loading, JS-driven insertion, or render-blocking work.',
+  // INP phases
+  'Input Delay': 'Time between the user interaction and the browser starting to run event handlers — caused by main thread being busy with other tasks.',
+  'Processing Time': 'Time spent executing the event handler JavaScript code.',
+  'Presentation Delay': 'Time from event handler completion to the next frame being painted on screen.',
+  'Pre-render': 'Time between event handler completion and the start of the rendering pipeline.',
+  'rAF & Observers': 'Time spent in requestAnimationFrame callbacks and other observer callbacks before rendering.',
+  'Style, Layout & Paint': 'Time the browser spends recalculating styles, computing layout, and painting pixels to screen.',
+};
+
+function phaseLabel(name) {
+  const desc = PHASE_DESCRIPTIONS[name];
+  if (!desc) return escHtml(name);
+  return `${escHtml(name)} <span class="info-icon" tabindex="0">i<span class="info-tip">${escHtml(desc)}</span></span>`;
+}
+
 function urlWithTooltip(url, maxLen) {
   const truncated = truncUrl(url, maxLen);
   const full = escHtml(url);
@@ -78,7 +126,7 @@ export function generateHtml(data, meta) {
   const totalJsPct = totalJsBytes > 0 ? (totalJsUnused / totalJsBytes * 100) : 0;
 
   const largest = [...resourceEntries].sort((a, b) => b.transferSize - a.transferSize).slice(0, 10);
-  const timelineEnd = Math.max(...resourceEntries.map(r => r.responseEnd), 1);
+  const timelineEnd = resourceEntries.reduce((max, r) => r.responseEnd > max ? r.responseEnd : max, 1);
   const resourceUrls = new Set(resourceEntries.map(r => r.name));
 
   return `<!DOCTYPE html>
@@ -141,6 +189,9 @@ export function generateHtml(data, meta) {
   .score-badge-green { background: #dcfce7; color: #16a34a; }
   .score-badge-yellow { background: #fef9c3; color: #ca8a04; }
   .score-badge-red { background: #fee2e2; color: #dc2626; }
+  .info-icon { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; border-radius: 50%; background: #e2e8f0; color: #64748b; font-size: 0.625rem; font-weight: 700; font-style: italic; font-family: Georgia, serif; cursor: help; position: relative; vertical-align: middle; margin-left: 0.25rem; flex-shrink: 0; }
+  .info-icon:hover .info-tip, .info-icon:focus .info-tip { display: block; }
+  .info-tip { display: none; position: absolute; left: calc(100% + 6px); top: 50%; transform: translateY(-50%); z-index: 20; background: #1e293b; color: #f1f5f9; font-size: 0.75rem; font-weight: 400; font-style: normal; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 0.5rem 0.75rem; border-radius: 6px; white-space: normal; width: 280px; line-height: 1.4; box-shadow: 0 4px 12px rgba(0,0,0,.2); pointer-events: none; }
   @media (max-width: 640px) { body { padding: 1rem; } .cards { flex-direction: column; } .waterfall-label { flex: 0 0 160px; } .gauge-wrap { flex-direction: column; align-items: flex-start; } }
 </style>
 </head>
@@ -148,7 +199,7 @@ export function generateHtml(data, meta) {
 <h1>Performance Audit</h1>
 <p class="meta">
   ${escHtml(meta.url)}<br>
-  ${escHtml(meta.date)}${meta.device ? ` · ${escHtml(meta.device.label)} (${meta.device.width}x${meta.device.height})` : ''}${meta.throttle ? ` · ${escHtml(meta.throttle.label)}` : ''}${meta.cpuThrottle > 1 ? ` · CPU ${meta.cpuThrottle}x` : ''}${meta.numRuns > 1 ? ` · ${meta.numRuns} runs (median)` : ''}${connectionInfo ? ` · ${connectionInfo.effectiveType} · ${connectionInfo.downlink}Mbps · RTT ${connectionInfo.rtt}ms` : ''}
+  ${escHtml(meta.date)}${meta.device ? ` · ${escHtml(meta.device.label)} (${meta.device.width}x${meta.device.height})` : ''}${meta.throttle ? ` · ${escHtml(meta.throttle.label)}` : ''}${meta.cpuThrottle > 1 ? ` · CPU ${meta.cpuThrottle}x` : ''}${meta.numRuns > 1 ? ` · ${meta.numRuns} runs (median)` : ''}${connectionInfo ? ` · ${escHtml(connectionInfo.effectiveType)} · ${escHtml(connectionInfo.downlink)}Mbps · RTT ${escHtml(connectionInfo.rtt)}ms` : ''}
 </p>
 
 <h2>Performance Score</h2>
@@ -177,7 +228,7 @@ ${(() => {
 <div class="cards">
 ${vitalCards.map(v => {
     const { label, color } = rate(v.value, v.good, v.poor);
-    const display = v.unit === 'ms' ? fmtMs(v.value) : v.value.toFixed(3);
+    const display = v.unit === 'ms' ? fmtMs(v.value) : (v.value ?? 0).toFixed(3);
     const tagClass = color === 'green' ? 'tag-good' : color === 'yellow' ? 'tag-warn' : 'tag-poor';
     const badgeClass = `score-badge-${color}`;
     return `  <div class="card">
@@ -246,7 +297,7 @@ ${(() => {
       const cellColor = isHighlight ? CSS_COLORS[ttfbRatingColor] : '';
       const styleAttr = cellColor ? ` style="color:${cellColor}"` : '';
       return `    <tr>
-      <td>${escHtml(name)}</td>
+      <td>${phaseLabel(name)}</td>
       <td class="r"${styleAttr}>${fmtMs(dur)}</td>
       <td class="r">${share.toFixed(1)}%</td>
       <td><div class="bar-container"><div class="bar-fill" style="width:${share.toFixed(1)}%;background:${cellColor || '#3b82f6'}"></div></div></td>
@@ -308,7 +359,7 @@ ${(() => {
       const cellColor = isHighlight ? CSS_COLORS[fcpRatingColor] : '';
       const styleAttr = cellColor ? ` style="color:${cellColor}"` : '';
       return `    <tr>
-      <td>${escHtml(name)}</td>
+      <td>${phaseLabel(name)}</td>
       <td class="r"${styleAttr}>${fmtMs(dur)}</td>
       <td class="r">${share.toFixed(1)}%</td>
       <td><div class="bar-container"><div class="bar-fill" style="width:${share.toFixed(1)}%;background:${cellColor || '#3b82f6'}"></div></div></td>
@@ -373,7 +424,7 @@ ${(() => {
       const cellColor = isHighlight ? CSS_COLORS[lcpRatingColor] : '';
       const styleAttr = cellColor ? ` style="color:${cellColor}"` : '';
       return `    <tr>
-      <td>${escHtml(name)}</td>
+      <td>${phaseLabel(name)}</td>
       <td class="r"${styleAttr}>${fmtMs(dur)}</td>
       <td class="r">${share.toFixed(1)}%</td>
       <td><div class="bar-container"><div class="bar-fill" style="width:${share.toFixed(1)}%;background:${cellColor || '#3b82f6'}"></div></div></td>
@@ -394,7 +445,7 @@ ${rows}
 
 <h2>CLS Breakdown</h2>
 ${(() => {
-    if (vitals.cls < 0.001) {
+    if (!vitals.cls || vitals.cls < 0.001) {
       return '<p class="dim">CLS is near-zero — no breakdown to show.</p>';
     }
 
@@ -499,7 +550,7 @@ ${(() => {
       const cellColor = isHighlight ? CSS_COLORS[inpRatingColor] : '';
       const styleAttr = cellColor ? ` style="color:${cellColor}"` : '';
       return `    <tr>
-      <td>${escHtml(name)}</td>
+      <td>${phaseLabel(name)}</td>
       <td class="r"${styleAttr}>${fmtMs(dur)}</td>
       <td class="r">${share.toFixed(1)}%</td>
       <td><div class="bar-container"><div class="bar-fill" style="width:${share.toFixed(1)}%;background:${cellColor || '#3b82f6'}"></div></div></td>
@@ -587,7 +638,7 @@ ${nav.nextHopProtocol ? `<p class="dim" style="margin-bottom:0.5rem">Protocol: $
 <table>
   <thead><tr><th>Phase</th><th class="r">Duration</th></tr></thead>
   <tbody>
-${timings.map(([name, ms]) => `    <tr><td>${escHtml(name)}</td><td class="r">${fmtMs(ms)}</td></tr>`).join('\n')}
+${timings.map(([name, ms]) => `    <tr><td>${phaseLabel(name)}</td><td class="r">${fmtMs(ms)}</td></tr>`).join('\n')}
   </tbody>
 </table>
 
@@ -709,8 +760,8 @@ ${meta.numRuns > 1 && meta.allResults ? `<h2>All Runs</h2>
 <table>
   <thead><tr><th>Run</th><th class="r">TTFB</th><th class="r">FCP</th><th class="r">LCP</th><th class="r">CLS</th><th class="r">TBT</th><th class="r">INP</th></tr></thead>
   <tbody>
-${meta.allResults.map((r, i) => `    <tr><td>${i + 1}</td><td class="r">${fmtMs(r.nav.responseStart - r.nav.startTime)}</td><td class="r">${fmtMs(r.vitals.fcp)}</td><td class="r">${fmtMs(r.vitals.lcp)}</td><td class="r">${r.vitals.cls.toFixed(3)}</td><td class="r">${fmtMs(r.tbt)}</td><td class="r">${fmtMs(r.inp || 0)}</td></tr>`).join('\n')}
-    <tr style="font-weight:700;border-top:2px solid #cbd5e1"><td>Median</td><td class="r">${fmtMs(meta.medianVitals.ttfb)}</td><td class="r">${fmtMs(meta.medianVitals.fcp)}</td><td class="r">${fmtMs(meta.medianVitals.lcp)}</td><td class="r">${meta.medianVitals.cls.toFixed(3)}</td><td class="r">${fmtMs(meta.medianVitals.tbt)}</td><td class="r">${fmtMs(meta.medianVitals.inp || 0)}</td></tr>
+${meta.allResults.map((r, i) => `    <tr><td>${i + 1}</td><td class="r">${fmtMs(r.nav.responseStart - r.nav.startTime)}</td><td class="r">${fmtMs(r.vitals.fcp)}</td><td class="r">${fmtMs(r.vitals.lcp)}</td><td class="r">${(r.vitals.cls ?? 0).toFixed(3)}</td><td class="r">${fmtMs(r.tbt)}</td><td class="r">${fmtMs(r.inp || 0)}</td></tr>`).join('\n')}
+    <tr style="font-weight:700;border-top:2px solid #cbd5e1"><td>Median</td><td class="r">${fmtMs(meta.medianVitals.ttfb)}</td><td class="r">${fmtMs(meta.medianVitals.fcp)}</td><td class="r">${fmtMs(meta.medianVitals.lcp)}</td><td class="r">${(meta.medianVitals.cls ?? 0).toFixed(3)}</td><td class="r">${fmtMs(meta.medianVitals.tbt)}</td><td class="r">${fmtMs(meta.medianVitals.inp || 0)}</td></tr>
   </tbody>
 </table>` : ''}
 
