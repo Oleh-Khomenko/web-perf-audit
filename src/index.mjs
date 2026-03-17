@@ -15,6 +15,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 
 import { CDPSession, httpJson } from './cdp.mjs';
 import { runAudit } from './audit.mjs';
+import { runCalibration, CALIBRATION_DEVICES, DEFAULT_CALIBRATION_DEVICE } from './calibrate.mjs';
 import { fmtMs, median } from './format.mjs';
 import { printReport, BOLD, DIM, RESET } from './report-console.mjs';
 import { generateHtml } from './report-html.mjs';
@@ -65,6 +66,9 @@ let THROTTLE = null; // default: no throttling
 let CPU_THROTTLE = 1; // multiplier: 1 = no slowdown
 let DEVICE = DEVICE_PRESETS.desktop; // default: desktop
 let PARALLEL = false;
+let CALIBRATE_DEVICE = null;
+let CALIBRATE_CUSTOM_MS = null;
+let CPU_THROTTLE_EXPLICIT = false;
 let EXTRA_HEADERS = {};
 let EXTRA_COOKIES = [];
 
@@ -86,6 +90,7 @@ if (args.includes('--help') || args.includes('-h')) {
     --device <preset>    Device emulation: desktop, tablet, mobile (default: desktop)
     --throttle <preset>  Simulate network conditions: slow-3g, fast-3g, 4g, none (default: 4g)
     --cpu-throttle <N>   CPU slowdown multiplier, e.g. 4 = 4x slower (default: 1, no throttle)
+    --calibrate [device|ms] Auto-detect CPU throttle (devices: ${Object.keys(CALIBRATION_DEVICES).join(', ')}; or custom ms e.g. 500; default: ${DEFAULT_CALIBRATION_DEVICE})
     --header "Name: Val"  Add a custom HTTP header (repeatable)
     --cookie "name=val"  Add a cookie for the target domain (repeatable)
     --html [path]        Save report as HTML file (default: perf-audit-{timestamp}.html in cwd)
@@ -113,6 +118,7 @@ if (args.includes('--help') || args.includes('-h')) {
     web-perf-audit https://example.com --throttle slow-3g
     web-perf-audit https://example.com --cpu-throttle 4
     web-perf-audit https://example.com --device mobile --throttle fast-3g --cpu-throttle 4
+    web-perf-audit https://example.com --calibrate
     web-perf-audit https://example.com --runs 5 --parallel
     web-perf-audit https://example.com --header "Authorization: Bearer tok"
     web-perf-audit https://example.com --cookie "session=abc123"
@@ -155,7 +161,27 @@ for (let i = 0; i < args.length; i++) {
       process.exit(1);
     }
     CPU_THROTTLE = rate;
+    CPU_THROTTLE_EXPLICIT = true;
     i++;
+  }
+  else if (args[i] === '--calibrate') {
+    // Peek at next arg — device key, custom ms value, or default
+    if (args[i + 1] && !args[i + 1].startsWith('--')) {
+      const val = args[i + 1];
+      const ms = Number(val);
+      if (!isNaN(ms) && ms > 0) {
+        CALIBRATE_DEVICE = 'custom';
+        CALIBRATE_CUSTOM_MS = ms;
+      } else if (CALIBRATION_DEVICES[val]) {
+        CALIBRATE_DEVICE = val;
+      } else {
+        console.error(`Unknown calibration device: "${val}"\nAvailable: ${Object.keys(CALIBRATION_DEVICES).join(', ')} or a number in ms (e.g. 500)`);
+        process.exit(1);
+      }
+      i++;
+    } else {
+      CALIBRATE_DEVICE = DEFAULT_CALIBRATION_DEVICE;
+    }
   }
   else if (args[i] === '--parallel') {
     PARALLEL = true;
@@ -195,6 +221,11 @@ for (let i = 0; i < args.length; i++) {
   else if (!args[i].startsWith('--')) {
     TARGET_URL = args[i];
   }
+}
+
+// -- Conflict warning --
+if (CALIBRATE_DEVICE && CPU_THROTTLE_EXPLICIT) {
+  console.warn('Warning: --calibrate and --cpu-throttle both set. --calibrate will override the manual value.');
 }
 
 // -- Validate URL early --
@@ -278,7 +309,7 @@ async function findChrome(chromeArgs, spawnOpts) {
 
 async function main() {
   const userDataDir = mkdtempSync(join(tmpdir(), 'perf-audit-'));
-  const debugPort = 9222 + Math.floor(Math.random() * 1000);
+  const debugPort = 9222 + Math.floor(Math.random() * 23000);
 
   // Launch Chrome
   const chromeArgs = [
@@ -304,9 +335,11 @@ async function main() {
   try {
   // Wait for CDP to be ready
   let wsUrl;
+  let chromeCrashed = null;
+  chromeProc.on('exit', (code) => { chromeCrashed = code; });
   for (let i = 0; i < 50; i++) {
-    if (chromeProc.exitCode !== null) {
-      throw new Error(`Chrome exited with code ${chromeProc.exitCode} before CDP was ready`);
+    if (chromeCrashed !== null || chromeProc.exitCode !== null) {
+      throw new Error(`Chrome exited with code ${chromeCrashed ?? chromeProc.exitCode} before CDP was ready`);
     }
     try {
       const info = await httpJson(`http://127.0.0.1:${debugPort}/json/version`, 'GET', 500);
@@ -341,9 +374,32 @@ async function main() {
     }
   }
 
+  // CPU calibration (before audit loop)
+  let calibrationResult = null;
+  if (CALIBRATE_DEVICE) {
+    const { browserContextId } = await browser.send('Target.createBrowserContext');
+    try {
+      const { targetId } = await browser.send('Target.createTarget', { url: 'about:blank', browserContextId });
+      const calCdp = new CDPSession(`ws://127.0.0.1:${debugPort}/devtools/page/${targetId}`);
+      await calCdp.connect();
+      try {
+        calibrationResult = await runCalibration(calCdp, CALIBRATE_DEVICE, CALIBRATE_CUSTOM_MS);
+        CPU_THROTTLE = calibrationResult.multiplier;
+        console.log(`${BOLD}CPU Calibration:${RESET} benchmark ${calibrationResult.measuredMs}ms → ${calibrationResult.multiplier}x throttle (ref: ${calibrationResult.referenceMs}ms ${calibrationResult.deviceLabel})`);
+      } finally {
+        calCdp.close();
+      }
+    } finally {
+      await browser.send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
+    }
+  }
+
   // Derive cookie domains from TARGET_URL now that URL is known
   const targetDomain = new URL(TARGET_URL).hostname;
-  const resolvedCookies = EXTRA_COOKIES.map(c => ({ ...c, domain: targetDomain, path: '/' }));
+  const resolvedCookies = EXTRA_COOKIES.map(c => {
+    const isLocalOrIp = targetDomain === 'localhost' || /^\d+\.\d+\.\d+\.\d+$/.test(targetDomain);
+    return { ...c, ...(isLocalOrIp ? {} : { domain: targetDomain }), path: '/', url: TARGET_URL };
+  });
 
   const auditOpts = { throttle: THROTTLE, cpuThrottle: CPU_THROTTLE, device: DEVICE, extraHeaders: EXTRA_HEADERS, extraCookies: resolvedCookies };
 
@@ -413,6 +469,8 @@ async function main() {
     const lcps = allResults.map(r => r.vitals.lcp);
     const clss = allResults.map(r => r.vitals.cls);
     const tbts = allResults.map(r => r.tbt);
+    const inpsMeasured = allResults.map(r => r.inpMeasured);
+    const measuredInps = allResults.filter(r => r.inpMeasured).map(r => r.inp);
     const inps = allResults.map(r => r.inp || 0);
 
     medianVitals = {
@@ -421,7 +479,7 @@ async function main() {
       lcp: median(lcps),
       cls: median(clss),
       tbt: median(tbts),
-      inp: median(inps),
+      inp: measuredInps.length > 0 ? median(measuredInps) : null,
     };
 
     console.log(`  ${'Run'.padEnd(6)} ${'TTFB'.padStart(10)} ${'FCP'.padStart(10)} ${'LCP'.padStart(10)} ${'CLS'.padStart(10)} ${'TBT'.padStart(10)} ${'INP'.padStart(10)}`);
@@ -429,13 +487,13 @@ async function main() {
 
     for (let i = 0; i < NUM_RUNS; i++) {
       console.log(
-        `  ${String(i + 1).padEnd(6)} ${fmtMs(ttfbs[i]).padStart(10)} ${fmtMs(fcps[i]).padStart(10)} ${fmtMs(lcps[i]).padStart(10)} ${clss[i].toFixed(3).padStart(10)} ${fmtMs(tbts[i]).padStart(10)} ${fmtMs(inps[i]).padStart(10)}`,
+        `  ${String(i + 1).padEnd(6)} ${fmtMs(ttfbs[i]).padStart(10)} ${fmtMs(fcps[i]).padStart(10)} ${fmtMs(lcps[i]).padStart(10)} ${clss[i].toFixed(3).padStart(10)} ${fmtMs(tbts[i]).padStart(10)} ${(inpsMeasured[i] ? fmtMs(inps[i]) : 'N/A').padStart(10)}`,
       );
     }
 
     console.log(`  ${'─'.repeat(6)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(10)}`);
     console.log(
-      `  ${BOLD}${'Median'.padEnd(6)} ${fmtMs(medianVitals.ttfb).padStart(10)} ${fmtMs(medianVitals.fcp).padStart(10)} ${fmtMs(medianVitals.lcp).padStart(10)} ${medianVitals.cls.toFixed(3).padStart(10)} ${fmtMs(medianVitals.tbt).padStart(10)} ${fmtMs(medianVitals.inp).padStart(10)}${RESET}`,
+      `  ${BOLD}${'Median'.padEnd(6)} ${fmtMs(medianVitals.ttfb).padStart(10)} ${fmtMs(medianVitals.fcp).padStart(10)} ${fmtMs(medianVitals.lcp).padStart(10)} ${medianVitals.cls.toFixed(3).padStart(10)} ${fmtMs(medianVitals.tbt).padStart(10)} ${(inpsMeasured.some(Boolean) ? fmtMs(medianVitals.inp) : 'N/A').padStart(10)}${RESET}`,
     );
     console.log();
   }
@@ -461,7 +519,7 @@ async function main() {
     console.log(`${DIM}Detailed report from run ${bestIdx + 1} (closest to median LCP).${RESET}\n`);
   }
 
-  printReport(reportData, { throttle: THROTTLE, cpuThrottle: CPU_THROTTLE, device: DEVICE });
+  printReport(reportData, { throttle: THROTTLE, cpuThrottle: CPU_THROTTLE, device: DEVICE, calibration: calibrationResult });
 
   // HTML report
   if (HTML_OUTPUT !== null) {
@@ -479,6 +537,7 @@ async function main() {
       throttle: THROTTLE,
       cpuThrottle: CPU_THROTTLE,
       device: DEVICE,
+      calibration: calibrationResult,
     });
 
     writeFileSync(htmlPath, html, 'utf-8');

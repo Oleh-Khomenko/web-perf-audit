@@ -37,6 +37,9 @@ export async function runAudit(cdp, targetUrl, options = {}) {
   await cdp.send('Profiler.enable');
   await cdp.send('Profiler.startPreciseCoverage', { callCount: false, detailed: true });
   await cdp.send('Profiler.start');
+  let _profilerStarted = true;
+
+  try {
 
   // Inject PerformanceObservers BEFORE navigation
   await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
@@ -70,7 +73,7 @@ export async function runAudit(cdp, targetUrl, options = {}) {
 
       new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
-          window.__perfData.cls += entry.value;
+          if (!entry.hadRecentInput) window.__perfData.cls += entry.value;
           window.__perfData.clsEntries.push({
             value: entry.value,
             startTime: entry.startTime,
@@ -190,12 +193,10 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     `,
   });
 
-  // Clear caches and storage before navigation
-  // Note: cookies are not cleared globally — each run uses a fresh browser context
-  // which already has no cookies. Clearing globally would break parallel runs with --cookie.
-  await cdp.send('Network.clearBrowserCache');
-  const origin = new URL(targetUrl).origin;
-  await cdp.send('Storage.clearDataForOrigin', { origin, storageTypes: 'all' });
+  // Cache and storage isolation: each run uses a fresh browser context
+  // (Target.createBrowserContext) which starts with empty storage/cookies.
+  // Network.setCacheDisabled (line 16) prevents all cache reads/writes per session.
+  // No global cache/storage clearing needed — it would disrupt parallel runs.
 
   // Set extra HTTP headers before navigation
   if (options.extraHeaders && Object.keys(options.extraHeaders).length > 0) {
@@ -235,26 +236,25 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     await cdp.send('Emulation.setCPUThrottlingRate', { rate: options.cpuThrottle });
   }
 
-  // Navigate — wrap the rest in try/finally to ensure profiler cleanup
-  let _profilerStarted = true;
-  try {
+  // Navigate — single 30s timeout covers both the CDP call and page load
   const navPromise = new Promise((resolve) => {
     cdp.on('Page.loadEventFired', () => resolve());
   });
 
-  const navResponse = await cdp.send('Page.navigate', { url: targetUrl });
+  function makeNavTimeout(ms = 30000) {
+    return new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Page load timed out after ${ms / 1000}s`)), ms)
+    );
+  }
+
+  const navResponse = await Promise.race([
+    cdp.send('Page.navigate', { url: targetUrl }),
+    makeNavTimeout(),
+  ]);
   if (navResponse.errorText) {
     throw new Error(`Navigation to ${targetUrl} failed: ${navResponse.errorText}`);
   }
-  let navTimer;
-  const navTimeout = new Promise((_, reject) =>
-    navTimer = setTimeout(() => reject(new Error('Page load timed out after 30s')), 30000)
-  );
-  try {
-    await Promise.race([navPromise, navTimeout]);
-  } finally {
-    clearTimeout(navTimer);
-  }
+  await Promise.race([navPromise, makeNavTimeout()]);
 
   // Wait for LCP and layout shifts to settle
   await new Promise((r) => setTimeout(r, 3000));
@@ -263,7 +263,7 @@ export async function runAudit(cdp, targetUrl, options = {}) {
   // Find the largest interactive element and click it, then press a key
   const { result: interactiveResult } = await cdp.send('Runtime.evaluate', {
     expression: `(() => {
-      const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [tabindex]');
+      const els = document.querySelectorAll('button, input, select, textarea, [role="button"], [tabindex]');
       let best = null, bestArea = 0;
       for (const el of els) {
         const rect = el.getBoundingClientRect();
@@ -313,6 +313,9 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     returnByValue: false,
   });
   const nav = safeJsonParse(navResult.value, {});
+  if (nav.responseStart == null || nav.startTime == null) {
+    throw new Error('Navigation timing data unavailable — page may have failed to load');
+  }
 
   // Server-Timing headers (toJSON() strips serverTiming array)
   const { result: serverTimingResult } = await cdp.send('Runtime.evaluate', {
@@ -323,7 +326,7 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     })))`,
     returnByValue: false,
   });
-  const serverTiming = safeJsonParse(serverTimingResult.value);
+  const serverTiming = safeJsonParse(serverTimingResult.value, []);
 
   // Web vitals
   const { result: vitalsResult } = await cdp.send('Runtime.evaluate', {
@@ -335,18 +338,71 @@ export async function runAudit(cdp, targetUrl, options = {}) {
   if (!vitals.inpEntries) vitals.inpEntries = [];
   if (!vitals.renderBlocking) vitals.renderBlocking = [];
   if (!vitals.clsEntries) vitals.clsEntries = [];
-  const tbt = vitals.longTasks.reduce((sum, lt) => sum + lt.blockingTime, 0);
+
+  // CLS spec: score = largest session window value (gap ≤ 1s, max 5s span).
+  // The injected observer accumulates the raw sum; recompute per spec here.
+  {
+    const shifts = vitals.clsEntries
+      .filter(e => !e.hadRecentInput)
+      .sort((a, b) => a.startTime - b.startTime);
+    let maxWindowValue = 0;
+    if (shifts.length > 0) {
+      let winStart = shifts[0].startTime;
+      let winValue = shifts[0].value;
+      let prevEnd = shifts[0].startTime + (shifts[0].duration || 0);
+      for (let i = 1; i < shifts.length; i++) {
+        const s = shifts[i];
+        const gap = s.startTime - prevEnd;
+        const span = (s.startTime + (s.duration || 0)) - winStart;
+        if (gap <= 1000 && span <= 5000) {
+          winValue += s.value;
+        } else {
+          if (winValue > maxWindowValue) maxWindowValue = winValue;
+          winStart = s.startTime;
+          winValue = s.value;
+        }
+        prevEnd = s.startTime + (s.duration || 0);
+      }
+      if (winValue > maxWindowValue) maxWindowValue = winValue;
+    }
+    vitals.cls = maxWindowValue;
+  }
+
+  // If LCP is 0 but FCP fired, LCP must be at least FCP.
+  // The browser may not have emitted an LCP entry (heavy SPA, extreme throttle).
+  if (vitals.lcp === 0 && vitals.fcp > 0) {
+    vitals.lcp = vitals.fcp;
+    vitals.lcpFallback = true;
+  }
+  // TBT = sum of blocking time for long tasks between FCP and end of load.
+  // Tasks straddling FCP are clipped: only the portion after FCP counts.
+  const fcp = vitals.fcp || 0;
+  function tbtBlockingTime(lt) {
+    const taskEnd = lt.startTime + lt.duration;
+    if (taskEnd <= fcp) return 0;
+    const clippedDuration = taskEnd - Math.max(lt.startTime, fcp);
+    return Math.max(0, clippedDuration - 50);
+  }
+  const tbt = vitals.longTasks.reduce((sum, lt) => sum + tbtBlockingTime(lt), 0);
+
+  // Filter long tasks that overlap with FCP+ window for per-script aggregation
+  const longTasksAfterFcp = vitals.longTasks.filter(lt => lt.startTime + lt.duration > fcp);
 
   // Aggregate long tasks by script URL (fall back to invoker for grouping)
   const tbtByScriptMap = new Map();
-  for (const lt of vitals.longTasks) {
+  for (const lt of longTasksAfterFcp) {
     const key = lt.scriptUrl || lt.invoker || '';
     const entry = tbtByScriptMap.get(key) || { scriptUrl: key, totalBlockingTime: 0, count: 0 };
-    entry.totalBlockingTime += lt.blockingTime;
+    entry.totalBlockingTime += tbtBlockingTime(lt);
     entry.count++;
     tbtByScriptMap.set(key, entry);
   }
   const tbtByScript = [...tbtByScriptMap.values()].sort((a, b) => b.totalBlockingTime - a.totalBlockingTime);
+  // Update stored blockingTime to FCP-clipped values for consistent display.
+  // LCP/INP phase breakdowns use duration (not blockingTime), so this is safe.
+  for (const lt of vitals.longTasks) {
+    lt.blockingTime = tbtBlockingTime(lt);
+  }
   const longTaskDetails = vitals.longTasks;
 
   // Resource entries (full)
@@ -484,7 +540,7 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     })))`,
     returnByValue: false,
   });
-  const preloadLinks = safeJsonParse(preloadResult.value);
+  const preloadLinks = safeJsonParse(preloadResult.value, []);
 
   // Rendering metrics from CDP Performance domain
   const { metrics: perfMetrics } = await cdp.send('Performance.getMetrics');
@@ -523,6 +579,7 @@ export async function runAudit(cdp, targetUrl, options = {}) {
     resourceSummary,
     jsCoverage: jsCoverageGrouped,
     inp: vitals.inp,
+    inpMeasured: vitals.inpEntries.length > 0,
     inpEntries: vitals.inpEntries,
     renderBlocking: vitals.renderBlocking,
     lcpElement: vitals.lcpElement,

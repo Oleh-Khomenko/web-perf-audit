@@ -36,7 +36,7 @@ function printTiming(name, ms, explanation) {
 }
 
 export function printReport(data, meta = {}) {
-  const { connectionInfo, nav, vitals, tbt, longTaskDetails = [], tbtByScript = [], resourceEntries, resourceSummary, jsCoverage, renderBlocking, lcpElement = null, clsEntries = [], inp = 0, inpEntries = [], preloadLinks, serverTiming = [], fontsReady = 0, renderMetrics = null, memoryInfo = null } = data;
+  const { connectionInfo, nav, vitals, tbt, longTaskDetails = [], tbtByScript = [], resourceEntries, resourceSummary, jsCoverage, renderBlocking, lcpElement = null, clsEntries = [], inp = 0, inpMeasured = false, inpEntries = [], preloadLinks, serverTiming = [], fontsReady = 0, renderMetrics = null, memoryInfo = null } = data;
 
   // Emulation info
   if (meta.device) {
@@ -46,7 +46,10 @@ export function printReport(data, meta = {}) {
     console.log(`  ${YELLOW}Network: ${meta.throttle.label}${RESET} ${DIM}(latency ${meta.throttle.latency}ms, down ${meta.throttle.downloadThroughput / 1024} KB/s, up ${meta.throttle.uploadThroughput / 1024} KB/s)${RESET}`);
   }
   if (meta.cpuThrottle > 1) {
-    console.log(`  ${YELLOW}CPU: ${meta.cpuThrottle}x slowdown${RESET}`);
+    console.log(`  ${YELLOW}CPU: ${meta.cpuThrottle}x slowdown${meta.calibration ? ' (calibrated)' : ''}${RESET}`);
+  }
+  if (meta.calibration) {
+    console.log(`  ${DIM}Calibrated: benchmark ${meta.calibration.measuredMs}ms, reference ${meta.calibration.referenceMs}ms (${meta.calibration.deviceLabel})${RESET}`);
   }
   if (meta.device || meta.throttle || meta.cpuThrottle > 1) console.log();
 
@@ -76,7 +79,7 @@ export function printReport(data, meta = {}) {
   printTiming('DNS Lookup', dns, 'Time to resolve domain name → affected by DNS provider & caching');
   printTiming('TCP Connection', tcp, 'Time to establish TCP handshake');
   if (tls >= 0) printTiming('TLS Negotiation', tls, 'Time for SSL/TLS handshake → affected by cert chain & protocol');
-  printTiming('Server Response (TTFB)', ttfbVal, 'Time from request sent to first byte received');
+  printTiming('Server Response', ttfbVal, 'Time from request sent to first byte received (request → response, excludes redirects/DNS/TCP)');
   printTiming('Content Download', download, 'Time to download the HTML response body');
   printTiming('DOM Interactive', domInteractive, 'Time from response to DOM being interactive (HTML parsed)');
   printTiming('DOM Content Loaded', domContentLoaded, 'Time from response to DOMContentLoaded event (sync scripts done)');
@@ -92,6 +95,7 @@ export function printReport(data, meta = {}) {
     tbt: tbt,
     cls: vitals.cls,
     inp: inp,
+    _inpMeasured: inpMeasured,
   });
   const scoreColor = overallScore >= 90 ? GREEN : overallScore >= 50 ? YELLOW : RED;
   console.log(`\n${BOLD}── Performance Score: ${scoreColor}${overallScore}/100${RESET}${BOLD} ──${RESET}\n`);
@@ -109,8 +113,14 @@ export function printReport(data, meta = {}) {
     'Cumulative Layout Shift — visual stability. Affected by: images without dimensions, dynamic content injection, web fonts.');
   printMetric('TBT', tbt, 'ms', 200, 600,
     'Total Blocking Time — main thread blocking after FCP. Affected by: heavy JS execution, large bundles, third-party scripts.');
-  printMetric('INP', inp, 'ms', 200, 500,
-    'Interaction to Next Paint — worst interaction latency (synthetic). Affected by: event handler complexity, main thread contention.');
+  if (inpMeasured) {
+    printMetric('INP', inp, 'ms', 200, 500,
+      'Interaction to Next Paint — worst interaction latency (synthetic). Affected by: event handler complexity, main thread contention.');
+  } else {
+    console.log(`  ${'INP'.padEnd(28)} ${'N/A'.padStart(10)}  ${DIM}[Not measured]${RESET}`);
+    console.log(`  ${DIM}No interactions captured during audit.${RESET}`);
+    console.log();
+  }
 
   // -- TTFB Breakdown --
   console.log(`${BOLD}── TTFB Breakdown ──${RESET}\n`);
@@ -196,6 +206,10 @@ export function printReport(data, meta = {}) {
   // -- LCP Breakdown --
   console.log(`${BOLD}── LCP Breakdown ──${RESET}\n`);
 
+  if (vitals.lcpFallback) {
+    console.log(`  ${YELLOW}LCP was not observed — using FCP (${fmtMs(vitals.fcp)}) as lower bound.${RESET}\n`);
+  }
+
   if (vitals.lcp < 1) {
     console.log(`  ${DIM}LCP is near-zero (${fmtMs(vitals.lcp)}) — no breakdown to show.${RESET}`);
   }
@@ -263,7 +277,8 @@ export function printReport(data, meta = {}) {
             }
           }
         }
-        const clsColor = w.value > 0.1 ? RED : w.value > 0.05 ? YELLOW : GREEN;
+        const { color: clsRating } = rate(w.value, 0.05, 0.1);
+        const clsColor = ANSI_COLORS[clsRating];
         console.log(
           `  ${String(i + 1).padEnd(4)} ${clsColor}${w.value.toFixed(4).padStart(10)}${RESET} ${fmtMs(w.start).padStart(8)} ${String(w.shifts.length).padStart(7)} ${worstSource}`,
         );
@@ -275,8 +290,8 @@ export function printReport(data, meta = {}) {
   // -- INP Breakdown --
   console.log(`${BOLD}── INP Breakdown ──${RESET}\n`);
 
-  if (inp < 1) {
-    console.log(`  ${DIM}INP is near-zero (${fmtMs(inp)}) — no interactions captured or all were instant.${RESET}`);
+  if (!inpMeasured) {
+    console.log(`  ${DIM}No interactions captured — INP could not be measured.${RESET}`);
   }
   else {
     const inpResult = computeInpPhases(inpEntries, longTaskDetails);
@@ -479,7 +494,7 @@ export function printReport(data, meta = {}) {
     .filter(r => criticalTypes.has(r.initiatorType))
     .sort((a, b) => a.startTime - b.startTime)
     .slice(0, 30);
-  const waterfallEnd = resourceEntries.reduce((max, r) => r.responseEnd > max ? r.responseEnd : max, 1);
+  const waterfallEnd = loadOrder.reduce((max, r) => r.responseEnd > max ? r.responseEnd : max, 1);
   const wfBarWidth = 40;
 
   console.log(`  ${'Resource'.padEnd(36)} ${'Type'.padEnd(8)} ${'Start'.padStart(7)} ${'Dur'.padStart(7)}  ${''.padEnd(wfBarWidth)}`);

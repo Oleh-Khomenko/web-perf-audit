@@ -69,11 +69,18 @@ export const METRIC_SCORING = [
 
 export function computeOverallScore(metricValues) {
   let total = 0;
+  let weightSum = 0;
   for (const m of METRIC_SCORING) {
-    const value = metricValues[m.key] ?? 0;
+    const value = metricValues[m.key];
+    // If a metric wasn't measured (null/undefined), exclude it and redistribute weight
+    if (value == null) continue;
+    // INP = 0 with no interactions means "not measured", not "perfect"
+    if (m.key === 'inp' && value === 0 && !metricValues._inpMeasured) continue;
     total += computeScore(value, m.p10, m.median) * m.weight;
+    weightSum += m.weight;
   }
-  return Math.round(total * 100);
+  if (weightSum === 0) return 0;
+  return Math.round((total / weightSum) * 100);
 }
 
 /**
@@ -91,8 +98,8 @@ export function computeFcpPhases(nav, fcp, resourceEntries) {
   }
   const blockingDuration = Math.max(0, Math.min(blockingEnd - ttfb, fcp - ttfb));
 
-  // HTML Parse: responseEnd → domInteractive
-  const htmlParse = Math.max(0, nav.domInteractive - nav.responseEnd);
+  // HTML Parse: responseEnd → domInteractive, capped so phases don't exceed FCP
+  const htmlParse = Math.min(Math.max(0, nav.domInteractive - nav.responseEnd), Math.max(0, fcp - ttfb - blockingDuration));
 
   // Style & Font loading after blocking resources finish
   const afterBlocking = Math.max(ttfb + blockingDuration, nav.responseEnd);
@@ -141,11 +148,15 @@ export function computeLcpPhases(nav, lcp, lcpElement, resourceEntries, longTask
     const windowDur = Math.max(0, windowEnd - windowStart);
     if (windowDur < 1) return [];
 
+    let remaining = windowDur;
+
     // 1. DOM Wait — time until DOMContentLoaded fires
-    const domWait = Math.max(0, Math.min(nav.domContentLoadedEventEnd - windowStart, windowDur));
+    const domWait = Math.min(Math.max(0, Math.min(nav.domContentLoadedEventEnd, windowEnd) - windowStart), remaining);
+    remaining -= domWait;
 
     // 2. Stylesheet Wait — non-blocking CSS completing after DOM milestone
-    const styleMilestone = Math.max(windowStart, nav.domContentLoadedEventEnd);
+    // Cap DCL at windowEnd so when DCL fires after LCP, domWait doesn't consume entire budget
+    const styleMilestone = Math.max(windowStart, Math.min(nav.domContentLoadedEventEnd, windowEnd));
     const nonBlockingStyles = resourceEntries.filter(r =>
       (r.initiatorType === 'link' || r.initiatorType === 'css') &&
       r.renderBlockingStatus !== 'blocking' &&
@@ -153,7 +164,8 @@ export function computeLcpPhases(nav, lcp, lcpElement, resourceEntries, longTask
     );
     const lastStyle = nonBlockingStyles.length > 0
       ? Math.max(...nonBlockingStyles.map(r => r.responseEnd)) : 0;
-    const stylesheetWait = lastStyle > 0 ? Math.max(0, lastStyle - styleMilestone) : 0;
+    const stylesheetWait = Math.min(lastStyle > 0 ? Math.max(0, lastStyle - styleMilestone) : 0, remaining);
+    remaining -= stylesheetWait;
 
     // 3. Font Wait — font resources completing after stylesheet milestone
     const fontMilestone = Math.max(styleMilestone, lastStyle || styleMilestone);
@@ -167,7 +179,8 @@ export function computeLcpPhases(nav, lcp, lcpElement, resourceEntries, longTask
       lastFontResource,
       fontsReady > fontMilestone && fontsReady <= windowEnd ? fontsReady : 0,
     );
-    const fontWait = lastFontTime > 0 ? Math.max(0, lastFontTime - fontMilestone) : 0;
+    const fontWait = Math.min(lastFontTime > 0 ? Math.max(0, lastFontTime - fontMilestone) : 0, remaining);
+    remaining -= fontWait;
 
     // 4. Long Tasks (JS) — overlap in remaining window after font milestone
     const jsStart = Math.max(fontMilestone, lastFontTime || fontMilestone);
@@ -177,10 +190,11 @@ export function computeLcpPhases(nav, lcp, lcpElement, resourceEntries, longTask
       const overlap = Math.min(taskEnd, windowEnd) - Math.max(lt.startTime, jsStart);
       if (overlap > 0) longTaskOverlap += overlap;
     }
-    longTaskOverlap = Math.min(longTaskOverlap, Math.max(0, windowEnd - jsStart));
+    longTaskOverlap = Math.min(longTaskOverlap, remaining);
+    remaining -= longTaskOverlap;
 
     // 5. Render Work — remainder
-    const renderWork = Math.max(0, windowDur - domWait - stylesheetWait - fontWait - longTaskOverlap);
+    const renderWork = remaining;
 
     return [
       ['DOM Wait', domWait],
@@ -217,7 +231,9 @@ export function computeLcpPhases(nav, lcp, lcpElement, resourceEntries, longTask
   }
 
   const resourceLoadDelay = Math.max(0, res.startTime - ttfb);
-  const resourceLoadDuration = Math.max(0, res.responseEnd - res.startTime);
+  const rawDownload = Math.max(0, res.responseEnd - res.startTime);
+  // Cap download so phases never exceed LCP (resource may finish after render)
+  const resourceLoadDuration = Math.min(rawDownload, Math.max(0, lcp - ttfb - resourceLoadDelay));
   const windowStart = ttfb + resourceLoadDelay + resourceLoadDuration;
   const renderPhases = computeRenderDelayPhases(windowStart, lcp);
 
@@ -248,8 +264,9 @@ export function buildClsSessionWindows(clsEntries) {
 
   for (let i = 1; i < shifts.length; i++) {
     const s = shifts[i];
-    const gap = s.startTime - (current.shifts[current.shifts.length - 1].startTime);
-    const duration = s.startTime - current.start;
+    const lastShift = current.shifts[current.shifts.length - 1];
+    const gap = s.startTime - (lastShift.startTime + (lastShift.duration || 0));
+    const duration = (s.startTime + (s.duration || 0)) - current.start;
 
     if (gap <= 1000 && duration <= 5000) {
       current.shifts.push(s);

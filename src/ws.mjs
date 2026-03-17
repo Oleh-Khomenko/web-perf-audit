@@ -32,7 +32,10 @@ export class MinimalWebSocket extends EventEmitter {
     });
 
     socket.on('data', (chunk) => this._onData(chunk));
-    socket.on('error', (err) => this._emit('error', err));
+    socket.on('error', (err) => {
+      this._emit('error', err);
+      if (this._opened) this._socket.destroy();
+    });
     socket.on('close', () => this._emit('close'));
 
     this._socket = socket;
@@ -101,8 +104,8 @@ export class MinimalWebSocket extends EventEmitter {
       if (opcode === OPCODES.TEXT) {
         this._emit('message', { data: payload.toString('utf-8') });
       } else if (opcode === OPCODES.CLOSE) {
-        this._sendFrame(OPCODES.CLOSE, payload);
-        this._socket.end();
+        try { this._sendFrame(OPCODES.CLOSE, payload); } catch {}
+        this._socket.destroy();
       } else if (opcode === OPCODES.PING) {
         this._sendFrame(OPCODES.PONG, payload);
       }
@@ -145,8 +148,8 @@ export class MinimalWebSocket extends EventEmitter {
 
   close() {
     if (!this._socket || this._socket.destroyed) return;
-    this._sendFrame(OPCODES.CLOSE, Buffer.alloc(0));
-    this._socket.end();
+    try { this._sendFrame(OPCODES.CLOSE, Buffer.alloc(0)); } catch {}
+    this._socket.destroy();
   }
 
   /** Mimic the browser WebSocket addEventListener API */

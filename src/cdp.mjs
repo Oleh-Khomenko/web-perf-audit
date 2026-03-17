@@ -39,18 +39,29 @@ export class CDPSession {
     this._events = new Map();
   }
 
-  async connect() {
+  async connect(timeoutMs = 15000) {
     return new Promise((resolve, reject) => {
       let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error(`CDP WebSocket connect timed out after ${timeoutMs}ms: ${this._wsUrl}`));
+          try { this._ws.close(); } catch {}
+        }
+      }, timeoutMs);
       this._ws = new WebSocket(this._wsUrl);
       this._ws.addEventListener('open', () => {
+        clearTimeout(timer);
         this._open = true;
         settled = true;
-        // Prevent post-open socket errors from crashing via unhandled EventEmitter 'error'
-        this._ws.addEventListener('error', () => {});
+        // On post-open errors, destroy socket to guarantee 'close' fires and pending commands are rejected
+        this._ws.addEventListener('error', () => {
+          try { this._ws.close(); } catch {}
+        });
         resolve();
       });
       this._ws.addEventListener('error', (e) => {
+        clearTimeout(timer);
         if (!settled) { settled = true; reject(e); }
       });
       this._ws.addEventListener('message', (event) => {

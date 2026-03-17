@@ -21,6 +21,7 @@ const PHASE_DESCRIPTIONS = {
   'TLS Negotiation': 'Time for the TLS/SSL handshake after the TCP connection is established.',
   'Request → Response': 'Time from sending the HTTP request to receiving the first byte of the response (server processing time).',
   'Server Response (TTFB)': 'Time from sending the HTTP request to receiving the first byte of the response.',
+  'Server Response': 'Time from sending the HTTP request to receiving the first byte (request → response, excludes redirects/DNS/TCP).',
   'Content Download': 'Time to download the full HTML response body after the first byte arrives.',
   'DOM Interactive': 'Time from response end until the DOM is fully parsed and interactive (scripts have executed).',
   'DOM Content Loaded': 'Time from response end until DOMContentLoaded fires — DOM is ready, deferred scripts have run.',
@@ -71,7 +72,7 @@ function urlWithTooltip(url, maxLen) {
  * @returns {string} Full HTML document string
  */
 export function generateHtml(data, meta) {
-  const { connectionInfo, nav, vitals, tbt, longTaskDetails = [], tbtByScript = [], resourceEntries, resourceSummary, jsCoverage, renderBlocking, lcpElement = null, clsEntries = [], inp = 0, inpEntries = [], preloadLinks, serverTiming = [], fontsReady = 0, renderMetrics = null, memoryInfo = null } = data;
+  const { connectionInfo, nav, vitals, tbt, longTaskDetails = [], tbtByScript = [], resourceEntries, resourceSummary, jsCoverage, renderBlocking, lcpElement = null, clsEntries = [], inp = 0, inpMeasured = false, inpEntries = [], preloadLinks, serverTiming = [], fontsReady = 0, renderMetrics = null, memoryInfo = null } = data;
 
   const dns = nav.domainLookupEnd - nav.domainLookupStart;
   const tcp = nav.connectEnd - nav.connectStart;
@@ -88,7 +89,7 @@ export function generateHtml(data, meta) {
     ['DNS Lookup', dns],
     ['TCP Connection', tcp],
     ...(tls >= 0 ? [['TLS Negotiation', tls]] : []),
-    ['Server Response (TTFB)', ttfbVal],
+    ['Server Response', ttfbVal],
     ['Content Download', download],
     ['DOM Interactive', domInteractive],
     ['DOM Content Loaded', domContentLoaded],
@@ -104,21 +105,25 @@ export function generateHtml(data, meta) {
     tbt: tbt,
     cls: vitals.cls,
     inp: inp,
+    _inpMeasured: inpMeasured,
   };
 
   const overallScore = computeOverallScore(metricValues);
 
-  const vitalCards = METRIC_SCORING.map(m => ({
-    name: m.name,
-    value: metricValues[m.key],
-    unit: m.key === 'cls' ? 'score' : 'ms',
-    good: m.good,
-    poor: m.poor,
-    p10: m.p10,
-    median: m.median,
-    weight: m.weight,
-    score: Math.round(computeScore(metricValues[m.key], m.p10, m.median) * 100),
-  }));
+  const vitalCards = METRIC_SCORING.map(m => {
+    const unmeasured = m.key === 'inp' && metricValues.inp === 0 && !metricValues._inpMeasured;
+    return {
+      name: m.name,
+      value: metricValues[m.key],
+      unit: m.key === 'cls' ? 'score' : 'ms',
+      good: m.good,
+      poor: m.poor,
+      p10: m.p10,
+      median: m.median,
+      weight: m.weight,
+      score: unmeasured ? null : Math.round(computeScore(metricValues[m.key], m.p10, m.median) * 100),
+    };
+  });
 
   const sortedCoverage = [...jsCoverage].sort((a, b) => b.unused - a.unused).slice(0, 15);
   const totalJsBytes = jsCoverage.reduce((s, e) => s + e.total, 0);
@@ -126,7 +131,8 @@ export function generateHtml(data, meta) {
   const totalJsPct = totalJsBytes > 0 ? (totalJsUnused / totalJsBytes * 100) : 0;
 
   const largest = [...resourceEntries].sort((a, b) => b.transferSize - a.transferSize).slice(0, 10);
-  const timelineEnd = resourceEntries.reduce((max, r) => r.responseEnd > max ? r.responseEnd : max, 1);
+  const criticalTypesForTimeline = new Set(['link', 'css', 'script']);
+  const timelineEnd = resourceEntries.filter(r => criticalTypesForTimeline.has(r.initiatorType)).reduce((max, r) => r.responseEnd > max ? r.responseEnd : max, nav.responseEnd || 1);
   const resourceUrls = new Set(resourceEntries.map(r => r.name));
 
   return `<!DOCTYPE html>
@@ -199,7 +205,7 @@ export function generateHtml(data, meta) {
 <h1>Performance Audit</h1>
 <p class="meta">
   ${escHtml(meta.url)}<br>
-  ${escHtml(meta.date)}${meta.device ? ` · ${escHtml(meta.device.label)} (${meta.device.width}x${meta.device.height})` : ''}${meta.throttle ? ` · ${escHtml(meta.throttle.label)}` : ''}${meta.cpuThrottle > 1 ? ` · CPU ${meta.cpuThrottle}x` : ''}${meta.numRuns > 1 ? ` · ${meta.numRuns} runs (median)` : ''}${connectionInfo ? ` · ${escHtml(connectionInfo.effectiveType)} · ${escHtml(connectionInfo.downlink)}Mbps · RTT ${escHtml(connectionInfo.rtt)}ms` : ''}
+  ${escHtml(meta.date)}${meta.device ? ` · ${escHtml(meta.device.label)} (${meta.device.width}x${meta.device.height})` : ''}${meta.throttle ? ` · ${escHtml(meta.throttle.label)}` : ''}${meta.cpuThrottle > 1 ? ` · CPU ${meta.cpuThrottle}x${meta.calibration ? ' (calibrated)' : ''}` : ''}${meta.numRuns > 1 ? ` · ${meta.numRuns} runs (median)` : ''}${connectionInfo ? ` · ${escHtml(connectionInfo.effectiveType)} · ${escHtml(connectionInfo.downlink)}Mbps · RTT ${escHtml(connectionInfo.rtt)}ms` : ''}
 </p>
 
 <h2>Performance Score</h2>
@@ -227,14 +233,16 @@ ${(() => {
 <h2>Web Vitals</h2>
 <div class="cards">
 ${vitalCards.map(v => {
-    const { label, color } = rate(v.value, v.good, v.poor);
-    const display = v.unit === 'ms' ? fmtMs(v.value) : (v.value ?? 0).toFixed(3);
+    const unmeasured = v.score === null;
+    const { label, color } = unmeasured ? { label: 'N/A', color: 'yellow' } : rate(v.value, v.good, v.poor);
+    const display = unmeasured ? 'N/A' : v.unit === 'ms' ? fmtMs(v.value) : (v.value ?? 0).toFixed(3);
     const tagClass = color === 'green' ? 'tag-good' : color === 'yellow' ? 'tag-warn' : 'tag-poor';
     const badgeClass = `score-badge-${color}`;
+    const scoreBadge = unmeasured ? '' : ` <span class="score-badge ${badgeClass}">${v.score}</span>`;
     return `  <div class="card">
-    <div class="card-label">${v.name} <span class="score-badge ${badgeClass}">${v.score}</span></div>
+    <div class="card-label">${v.name}${scoreBadge}</div>
     <div class="card-value" style="color:${CSS_COLORS[color]}">${display}</div>
-    <div class="card-rating ${tagClass}">${label} · ${Math.round(v.weight * 100)}% weight</div>
+    <div class="card-rating ${tagClass}">${unmeasured ? 'No interactions captured' : `${label} · ${Math.round(v.weight * 100)}% weight`}</div>
   </div>`;
   }).join('\n')}
 </div>
@@ -379,7 +387,10 @@ ${rows}
 
 <h2>LCP Breakdown</h2>
 ${(() => {
-    if (vitals.lcp < 1) {
+    if (vitals.lcpFallback) {
+      // Continue with breakdown but show fallback note
+    }
+    else if (vitals.lcp < 1) {
       return '<p class="dim">LCP is near-zero — no breakdown to show.</p>';
     }
 
@@ -431,7 +442,11 @@ ${(() => {
     </tr>`;
     }).join('\n');
 
-    return `<p>Total LCP: <strong style="color:${CSS_COLORS[lcpRatingColor]}">${fmtMs(vitals.lcp)}</strong> (navigation start → largest contentful paint)</p>
+    const fallbackNote = vitals.lcpFallback
+      ? `<p style="background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:0.5rem 0.75rem;font-size:0.875rem">LCP was not observed — using FCP (${fmtMs(vitals.fcp)}) as lower bound.</p>`
+      : '';
+
+    return `${fallbackNote}<p>Total LCP: <strong style="color:${CSS_COLORS[lcpRatingColor]}">${fmtMs(vitals.lcp)}</strong> (navigation start → largest contentful paint)</p>
 ${elementHtml}
 <div class="waterfall-legend" style="margin-top:0.75rem">${legend}</div>
 <div style="background:#e2e8f0;border-radius:6px;height:20px;overflow:hidden;margin-bottom:1rem;font-size:0;line-height:0;white-space:nowrap">${stackedSegments}</div>
@@ -510,8 +525,8 @@ ${shiftDetails}
 
 <h2>INP Breakdown</h2>
 ${(() => {
-    if (inp < 1) {
-      return '<p class="dim">INP is near-zero — no interactions captured or all were instant.</p>';
+    if (!inpMeasured) {
+      return '<p class="dim">No interactions captured — INP could not be measured.</p>';
     }
 
     const inpResult = computeInpPhases(inpEntries, longTaskDetails);
@@ -760,8 +775,8 @@ ${meta.numRuns > 1 && meta.allResults ? `<h2>All Runs</h2>
 <table>
   <thead><tr><th>Run</th><th class="r">TTFB</th><th class="r">FCP</th><th class="r">LCP</th><th class="r">CLS</th><th class="r">TBT</th><th class="r">INP</th></tr></thead>
   <tbody>
-${meta.allResults.map((r, i) => `    <tr><td>${i + 1}</td><td class="r">${fmtMs(r.nav.responseStart - r.nav.startTime)}</td><td class="r">${fmtMs(r.vitals.fcp)}</td><td class="r">${fmtMs(r.vitals.lcp)}</td><td class="r">${(r.vitals.cls ?? 0).toFixed(3)}</td><td class="r">${fmtMs(r.tbt)}</td><td class="r">${fmtMs(r.inp || 0)}</td></tr>`).join('\n')}
-    <tr style="font-weight:700;border-top:2px solid #cbd5e1"><td>Median</td><td class="r">${fmtMs(meta.medianVitals.ttfb)}</td><td class="r">${fmtMs(meta.medianVitals.fcp)}</td><td class="r">${fmtMs(meta.medianVitals.lcp)}</td><td class="r">${(meta.medianVitals.cls ?? 0).toFixed(3)}</td><td class="r">${fmtMs(meta.medianVitals.tbt)}</td><td class="r">${fmtMs(meta.medianVitals.inp || 0)}</td></tr>
+${meta.allResults.map((r, i) => `    <tr><td>${i + 1}</td><td class="r">${fmtMs(r.nav.responseStart - r.nav.startTime)}</td><td class="r">${fmtMs(r.vitals.fcp)}</td><td class="r">${fmtMs(r.vitals.lcp)}</td><td class="r">${(r.vitals.cls ?? 0).toFixed(3)}</td><td class="r">${fmtMs(r.tbt)}</td><td class="r">${r.inpMeasured ? fmtMs(r.inp || 0) : 'N/A'}</td></tr>`).join('\n')}
+    <tr style="font-weight:700;border-top:2px solid #cbd5e1"><td>Median</td><td class="r">${fmtMs(meta.medianVitals.ttfb)}</td><td class="r">${fmtMs(meta.medianVitals.fcp)}</td><td class="r">${fmtMs(meta.medianVitals.lcp)}</td><td class="r">${(meta.medianVitals.cls ?? 0).toFixed(3)}</td><td class="r">${fmtMs(meta.medianVitals.tbt)}</td><td class="r">${meta.medianVitals.inp != null ? fmtMs(meta.medianVitals.inp) : 'N/A'}</td></tr>
   </tbody>
 </table>` : ''}
 
