@@ -57,6 +57,16 @@ const BENCHMARK_JS = `
 `;
 
 /**
+ * Compute throttle multiplier from reference and measured benchmark times.
+ * Clamps to [1.0, 12.0], rounds to 1 decimal.
+ */
+export function computeMultiplier(referenceMs, measuredMs) {
+  if (measuredMs <= 0) throw new Error(`Measured time ${measuredMs}ms is invalid`);
+  const raw = referenceMs / measuredMs;
+  return Math.round(Math.min(12.0, Math.max(1.0, raw)) * 10) / 10;
+}
+
+/**
  * Run the CPU calibration benchmark in Chrome via CDP.
  *
  * @param {import('./cdp.mjs').CDPSession} cdp - Connected CDP session (page target)
@@ -86,12 +96,7 @@ export async function runCalibration(cdp, deviceKey = DEFAULT_CALIBRATION_DEVICE
   }
 
   const measuredMs = result.value;
-  if (measuredMs <= 0) {
-    throw new Error(`Calibration benchmark returned ${measuredMs}ms — cannot compute multiplier`);
-  }
-  const raw = referenceMs / measuredMs;
-  // Clamp to [1.0, 12.0], round to 1 decimal
-  const multiplier = Math.round(Math.min(12.0, Math.max(1.0, raw)) * 10) / 10;
+  const multiplier = computeMultiplier(referenceMs, measuredMs);
 
   return { multiplier, measuredMs: Math.round(measuredMs), referenceMs, deviceKey, deviceLabel };
 }

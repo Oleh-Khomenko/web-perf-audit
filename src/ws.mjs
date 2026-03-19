@@ -5,10 +5,77 @@
  */
 
 import { connect } from 'node:net';
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 
-const OPCODES = { TEXT: 0x1, CLOSE: 0x8, PING: 0x9, PONG: 0xa };
+export const OPCODES = { TEXT: 0x1, CLOSE: 0x8, PING: 0x9, PONG: 0xa };
+
+/**
+ * Encode a WebSocket frame with masking.
+ * @param {number} opcode
+ * @param {Buffer} payload
+ * @param {Buffer} mask - 4-byte mask key
+ * @returns {Buffer} Complete frame
+ */
+export function encodeFrame(opcode, payload, mask) {
+  let header;
+  if (payload.length < 126) {
+    header = Buffer.alloc(6);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | payload.length;
+    mask.copy(header, 2);
+  } else if (payload.length < 65536) {
+    header = Buffer.alloc(8);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(payload.length, 2);
+    mask.copy(header, 4);
+  } else {
+    header = Buffer.alloc(14);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 127;
+    header.writeBigUInt64BE(BigInt(payload.length), 2);
+    mask.copy(header, 10);
+  }
+  const masked = Buffer.from(payload);
+  for (let i = 0; i < masked.length; i++) masked[i] ^= mask[i % 4];
+  return Buffer.concat([header, masked]);
+}
+
+/**
+ * Parse a single WebSocket frame from a buffer.
+ * @param {Buffer} buf
+ * @returns {{ opcode: number, payload: Buffer, frameLen: number } | null}
+ */
+export function parseFrame(buf) {
+  if (buf.length < 2) return null;
+  const opcode = buf[0] & 0x0f;
+  const isMasked = (buf[1] & 0x80) !== 0;
+  let payloadLen = buf[1] & 0x7f;
+  let offset = 2;
+
+  if (payloadLen === 126) {
+    if (buf.length < 4) return null;
+    payloadLen = buf.readUInt16BE(2);
+    offset = 4;
+  } else if (payloadLen === 127) {
+    if (buf.length < 10) return null;
+    payloadLen = Number(buf.readBigUInt64BE(2));
+    offset = 10;
+  }
+
+  if (isMasked) offset += 4;
+  if (buf.length < offset + payloadLen) return null;
+
+  let payload = buf.subarray(offset, offset + payloadLen);
+  if (isMasked) {
+    const maskKey = buf.subarray(offset - 4, offset);
+    payload = Buffer.from(payload);
+    for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4];
+  }
+
+  return { opcode, payload, frameLen: offset + payloadLen };
+}
 
 export class MinimalWebSocket extends EventEmitter {
   constructor(url) {
@@ -71,43 +138,18 @@ export class MinimalWebSocket extends EventEmitter {
 
   _parseFrames() {
     while (this._buffer.length >= 2) {
-      const byte0 = this._buffer[0];
-      const byte1 = this._buffer[1];
-      const opcode = byte0 & 0x0f;
-      const masked = (byte1 & 0x80) !== 0;
-      let payloadLen = byte1 & 0x7f;
-      let offset = 2;
+      const frame = parseFrame(this._buffer);
+      if (!frame) return;
 
-      if (payloadLen === 126) {
-        if (this._buffer.length < 4) return;
-        payloadLen = this._buffer.readUInt16BE(2);
-        offset = 4;
-      } else if (payloadLen === 127) {
-        if (this._buffer.length < 10) return;
-        // Read as BigInt, but CDP messages won't exceed safe integer range
-        payloadLen = Number(this._buffer.readBigUInt64BE(2));
-        offset = 10;
-      }
+      this._buffer = this._buffer.subarray(frame.frameLen);
 
-      if (masked) offset += 4; // skip mask key (server frames shouldn't be masked, but handle it)
-      if (this._buffer.length < offset + payloadLen) return;
-
-      let payload = this._buffer.subarray(offset, offset + payloadLen);
-      if (masked) {
-        const maskKey = this._buffer.subarray(offset - 4, offset);
-        payload = Buffer.from(payload); // copy before mutating
-        for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4];
-      }
-
-      this._buffer = this._buffer.subarray(offset + payloadLen);
-
-      if (opcode === OPCODES.TEXT) {
-        this._emit('message', { data: payload.toString('utf-8') });
-      } else if (opcode === OPCODES.CLOSE) {
-        try { this._sendFrame(OPCODES.CLOSE, payload); } catch {}
+      if (frame.opcode === OPCODES.TEXT) {
+        this._emit('message', { data: frame.payload.toString('utf-8') });
+      } else if (frame.opcode === OPCODES.CLOSE) {
+        try { this._sendFrame(OPCODES.CLOSE, frame.payload); } catch {}
         this._socket.destroy();
-      } else if (opcode === OPCODES.PING) {
-        this._sendFrame(OPCODES.PONG, payload);
+      } else if (frame.opcode === OPCODES.PING) {
+        this._sendFrame(OPCODES.PONG, frame.payload);
       }
     }
   }
@@ -119,31 +161,7 @@ export class MinimalWebSocket extends EventEmitter {
   _sendFrame(opcode, payload) {
     if (!this._socket || this._socket.destroyed) return;
     const mask = randomBytes(4);
-    let header;
-
-    if (payload.length < 126) {
-      header = Buffer.alloc(6);
-      header[0] = 0x80 | opcode; // FIN + opcode
-      header[1] = 0x80 | payload.length; // MASK + length
-      mask.copy(header, 2);
-    } else if (payload.length < 65536) {
-      header = Buffer.alloc(8);
-      header[0] = 0x80 | opcode;
-      header[1] = 0x80 | 126;
-      header.writeUInt16BE(payload.length, 2);
-      mask.copy(header, 4);
-    } else {
-      header = Buffer.alloc(14);
-      header[0] = 0x80 | opcode;
-      header[1] = 0x80 | 127;
-      header.writeBigUInt64BE(BigInt(payload.length), 2);
-      mask.copy(header, 10);
-    }
-
-    const masked = Buffer.from(payload);
-    for (let i = 0; i < masked.length; i++) masked[i] ^= mask[i % 4];
-
-    this._socket.write(Buffer.concat([header, masked]));
+    this._socket.write(encodeFrame(opcode, payload, mask));
   }
 
   close() {

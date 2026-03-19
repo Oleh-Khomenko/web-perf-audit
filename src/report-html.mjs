@@ -59,6 +59,57 @@ function phaseLabel(name) {
   return `${escHtml(name)} <span class="info-icon" tabindex="0">i<span class="info-tip">${escHtml(desc)}</span></span>`;
 }
 
+/** Render a stacked bar chart from phases. Last segment absorbs rounding remainder. */
+function renderStackedBar(phases, total, segColors) {
+  let usedPct = 0;
+  return phases.map(([name, dur], i) => {
+    const isLast = i === phases.length - 1;
+    const exactPct = total > 0 ? (dur / total * 100) : 0;
+    const pct = isLast ? Math.max(0, 100 - usedPct) : exactPct;
+    usedPct += exactPct;
+    const bg = segColors[name] || '#94a3b8';
+    return pct > 0 ? `<div style="width:${pct}%;background:${bg};height:100%;display:inline-block" title="${escHtml(name)}: ${fmtMs(dur)} (${exactPct.toFixed(1)}%)"></div>` : '';
+  }).join('');
+}
+
+/** Render colored legend dots for phases. */
+function renderPhaseLegend(phases, segColors) {
+  return phases.map(([name]) => {
+    return `<span><span class="waterfall-legend-dot" style="background:${segColors[name] || '#94a3b8'}"></span> ${escHtml(name)}</span>`;
+  }).join(' ');
+}
+
+/** Render a phase table with duration, share %, and bar. */
+function renderPhaseTable(phases, total, ratingColor, segColors) {
+  return phases.map(([name, dur]) => {
+    const share = total > 0 ? (dur / total * 100) : 0;
+    const isHighlight = share > 50 && ratingColor !== 'green';
+    const cellColor = isHighlight ? CSS_COLORS[ratingColor] : '';
+    const styleAttr = cellColor ? ` style="color:${cellColor}"` : '';
+    return `    <tr>
+      <td>${phaseLabel(name)}</td>
+      <td class="r"${styleAttr}>${fmtMs(dur)}</td>
+      <td class="r">${share.toFixed(1)}%</td>
+      <td><div class="bar-container"><div class="bar-fill" style="width:${share.toFixed(1)}%;background:${cellColor || '#3b82f6'}"></div></div></td>
+    </tr>`;
+  }).join('\n');
+}
+
+/** Render a full breakdown section: legend + stacked bar + phase table. */
+function renderBreakdownSection(phases, total, ratingColor, segColors) {
+  const stackedSegments = renderStackedBar(phases, total, segColors);
+  const legend = renderPhaseLegend(phases, segColors);
+  const rows = renderPhaseTable(phases, total, ratingColor, segColors);
+  return `<div class="waterfall-legend" style="margin-top:0.75rem">${legend}</div>
+<div style="background:#e2e8f0;border-radius:6px;height:20px;overflow:hidden;margin-bottom:1rem;font-size:0;line-height:0;white-space:nowrap">${stackedSegments}</div>
+<table>
+  <thead><tr><th>Phase</th><th class="r">Duration</th><th class="r">Share</th><th style="width:120px"></th></tr></thead>
+  <tbody>
+${rows}
+  </tbody>
+</table>`;
+}
+
 function urlWithTooltip(url, maxLen) {
   const truncated = truncUrl(url, maxLen);
   const full = escHtml(url);
@@ -282,36 +333,6 @@ ${(() => {
 
     const segColors = { 'Redirect': '#94a3b8', 'Unload': '#a1a1aa', 'Service Worker': '#e879f9', 'Queue / Stale Check': '#fb923c', 'DNS Lookup': '#8b5cf6', 'TCP Connection': '#3b82f6', 'TLS Negotiation': '#06b6d4', 'Request → Response': '#f59e0b', 'Other': '#64748b' };
 
-    // Stacked bar — use exact percentages, last segment absorbs rounding remainder
-    const stackedSegments = (() => {
-      let usedPct = 0;
-      return phases.map(([name, dur], i) => {
-        const isLast = i === phases.length - 1;
-        const exactPct = ttfbTotal > 0 ? (dur / ttfbTotal * 100) : 0;
-        const pct = isLast ? Math.max(0, 100 - usedPct) : exactPct;
-        usedPct += exactPct;
-        const bg = segColors[name] || '#94a3b8';
-        return pct > 0 ? `<div style="width:${pct}%;background:${bg};height:100%;display:inline-block" title="${escHtml(name)}: ${fmtMs(dur)} (${exactPct.toFixed(1)}%)"></div>` : '';
-      }).join('');
-    })();
-
-    const legend = phases.map(([name]) => {
-      return `<span><span class="waterfall-legend-dot" style="background:${segColors[name] || '#94a3b8'}"></span> ${escHtml(name)}</span>`;
-    }).join(' ');
-
-    const rows = phases.map(([name, dur]) => {
-      const share = ttfbTotal > 0 ? (dur / ttfbTotal * 100) : 0;
-      const isHighlight = share > 50 && ttfbRatingColor !== 'green';
-      const cellColor = isHighlight ? CSS_COLORS[ttfbRatingColor] : '';
-      const styleAttr = cellColor ? ` style="color:${cellColor}"` : '';
-      return `    <tr>
-      <td>${phaseLabel(name)}</td>
-      <td class="r"${styleAttr}>${fmtMs(dur)}</td>
-      <td class="r">${share.toFixed(1)}%</td>
-      <td><div class="bar-container"><div class="bar-fill" style="width:${share.toFixed(1)}%;background:${cellColor || '#3b82f6'}"></div></div></td>
-    </tr>`;
-    }).join('\n');
-
     const serverTimingHtml = serverTiming.length > 0 ? `
 <details style="margin-top:0.75rem">
   <summary style="cursor:pointer;font-size:0.875rem;color:#64748b">Server-Timing headers (${serverTiming.length})</summary>
@@ -324,14 +345,7 @@ ${serverTiming.map(st => `      <tr><td class="mono">${escHtml(st.name)}</td><td
 </details>` : '';
 
     return `<p>Total TTFB: <strong style="color:${CSS_COLORS[ttfbRatingColor]}">${fmtMs(ttfbTotal)}</strong> (navigation start → first byte)</p>
-<div class="waterfall-legend" style="margin-top:0.75rem">${legend}</div>
-<div style="background:#e2e8f0;border-radius:6px;height:20px;overflow:hidden;margin-bottom:1rem;font-size:0;line-height:0;white-space:nowrap">${stackedSegments}</div>
-<table>
-  <thead><tr><th>Phase</th><th class="r">Duration</th><th class="r">Share</th><th style="width:120px"></th></tr></thead>
-  <tbody>
-${rows}
-  </tbody>
-</table>${serverTimingHtml}`;
+${renderBreakdownSection(phases, ttfbTotal, ttfbRatingColor, segColors)}${serverTimingHtml}`;
   })()}
 
 <h2>FCP Breakdown</h2>
@@ -345,44 +359,8 @@ ${(() => {
 
     const segColors = { 'TTFB': '#8b5cf6', 'Blocking Resources': '#dc2626', 'HTML Parse': '#3b82f6', 'Style & Font Load': '#06b6d4', 'Render Setup': '#f59e0b' };
 
-    const stackedSegments = (() => {
-      let usedPct = 0;
-      return fcpPhases.map(([name, dur], i) => {
-        const isLast = i === fcpPhases.length - 1;
-        const exactPct = vitals.fcp > 0 ? (dur / vitals.fcp * 100) : 0;
-        const pct = isLast ? Math.max(0, 100 - usedPct) : exactPct;
-        usedPct += exactPct;
-        const bg = segColors[name] || '#94a3b8';
-        return pct > 0 ? `<div style="width:${pct}%;background:${bg};height:100%;display:inline-block" title="${escHtml(name)}: ${fmtMs(dur)} (${exactPct.toFixed(1)}%)"></div>` : '';
-      }).join('');
-    })();
-
-    const legend = fcpPhases.map(([name]) => {
-      return `<span><span class="waterfall-legend-dot" style="background:${segColors[name] || '#94a3b8'}"></span> ${escHtml(name)}</span>`;
-    }).join(' ');
-
-    const rows = fcpPhases.map(([name, dur]) => {
-      const share = vitals.fcp > 0 ? (dur / vitals.fcp * 100) : 0;
-      const isHighlight = share > 50 && fcpRatingColor !== 'green';
-      const cellColor = isHighlight ? CSS_COLORS[fcpRatingColor] : '';
-      const styleAttr = cellColor ? ` style="color:${cellColor}"` : '';
-      return `    <tr>
-      <td>${phaseLabel(name)}</td>
-      <td class="r"${styleAttr}>${fmtMs(dur)}</td>
-      <td class="r">${share.toFixed(1)}%</td>
-      <td><div class="bar-container"><div class="bar-fill" style="width:${share.toFixed(1)}%;background:${cellColor || '#3b82f6'}"></div></div></td>
-    </tr>`;
-    }).join('\n');
-
     return `<p>Total FCP: <strong style="color:${CSS_COLORS[fcpRatingColor]}">${fmtMs(vitals.fcp)}</strong> (navigation start → first contentful paint)</p>
-<div class="waterfall-legend" style="margin-top:0.75rem">${legend}</div>
-<div style="background:#e2e8f0;border-radius:6px;height:20px;overflow:hidden;margin-bottom:1rem;font-size:0;line-height:0;white-space:nowrap">${stackedSegments}</div>
-<table>
-  <thead><tr><th>Phase</th><th class="r">Duration</th><th class="r">Share</th><th style="width:120px"></th></tr></thead>
-  <tbody>
-${rows}
-  </tbody>
-</table>`;
+${renderBreakdownSection(fcpPhases, vitals.fcp, fcpRatingColor, segColors)}`;
   })()}
 
 <h2>LCP Breakdown</h2>
@@ -413,49 +391,13 @@ ${(() => {
 </div>`;
     }
 
-    const stackedSegments = (() => {
-      let usedPct = 0;
-      return lcpResult.phases.map(([name, dur], i) => {
-        const isLast = i === lcpResult.phases.length - 1;
-        const exactPct = vitals.lcp > 0 ? (dur / vitals.lcp * 100) : 0;
-        const pct = isLast ? Math.max(0, 100 - usedPct) : exactPct;
-        usedPct += exactPct;
-        const bg = segColors[name] || '#94a3b8';
-        return pct > 0 ? `<div style="width:${pct}%;background:${bg};height:100%;display:inline-block" title="${escHtml(name)}: ${fmtMs(dur)} (${exactPct.toFixed(1)}%)"></div>` : '';
-      }).join('');
-    })();
-
-    const legend = lcpResult.phases.map(([name]) => {
-      return `<span><span class="waterfall-legend-dot" style="background:${segColors[name] || '#94a3b8'}"></span> ${escHtml(name)}</span>`;
-    }).join(' ');
-
-    const rows = lcpResult.phases.map(([name, dur]) => {
-      const share = vitals.lcp > 0 ? (dur / vitals.lcp * 100) : 0;
-      const isHighlight = share > 50 && lcpRatingColor !== 'green';
-      const cellColor = isHighlight ? CSS_COLORS[lcpRatingColor] : '';
-      const styleAttr = cellColor ? ` style="color:${cellColor}"` : '';
-      return `    <tr>
-      <td>${phaseLabel(name)}</td>
-      <td class="r"${styleAttr}>${fmtMs(dur)}</td>
-      <td class="r">${share.toFixed(1)}%</td>
-      <td><div class="bar-container"><div class="bar-fill" style="width:${share.toFixed(1)}%;background:${cellColor || '#3b82f6'}"></div></div></td>
-    </tr>`;
-    }).join('\n');
-
     const fallbackNote = vitals.lcpFallback
       ? `<p style="background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:0.5rem 0.75rem;font-size:0.875rem">LCP was not observed — using FCP (${fmtMs(vitals.fcp)}) as lower bound.</p>`
       : '';
 
     return `${fallbackNote}<p>Total LCP: <strong style="color:${CSS_COLORS[lcpRatingColor]}">${fmtMs(vitals.lcp)}</strong> (navigation start → largest contentful paint)</p>
 ${elementHtml}
-<div class="waterfall-legend" style="margin-top:0.75rem">${legend}</div>
-<div style="background:#e2e8f0;border-radius:6px;height:20px;overflow:hidden;margin-bottom:1rem;font-size:0;line-height:0;white-space:nowrap">${stackedSegments}</div>
-<table>
-  <thead><tr><th>Phase</th><th class="r">Duration</th><th class="r">Share</th><th style="width:120px"></th></tr></thead>
-  <tbody>
-${rows}
-  </tbody>
-</table>${renderMetrics && (renderMetrics.LayoutDuration > 0 || renderMetrics.RecalcStyleDuration > 0) ? `<p class="dim" style="margin-top:0.5rem;font-size:0.75rem">Page-wide rendering cost: ${fmtMs(renderMetrics.LayoutDuration)} layout (&times;${renderMetrics.LayoutCount}), ${fmtMs(renderMetrics.RecalcStyleDuration)} style recalc (&times;${renderMetrics.RecalcStyleCount})</p>` : ''}`;
+${renderBreakdownSection(lcpResult.phases, vitals.lcp, lcpRatingColor, segColors)}${renderMetrics && (renderMetrics.LayoutDuration > 0 || renderMetrics.RecalcStyleDuration > 0) ? `<p class="dim" style="margin-top:0.5rem;font-size:0.75rem">Page-wide rendering cost: ${fmtMs(renderMetrics.LayoutDuration)} layout (&times;${renderMetrics.LayoutCount}), ${fmtMs(renderMetrics.RecalcStyleDuration)} style recalc (&times;${renderMetrics.RecalcStyleCount})</p>` : ''}`;
   })()}
 
 <h2>CLS Breakdown</h2>
@@ -543,35 +485,6 @@ ${(() => {
   <strong>Worst interaction:</strong> <code>${escHtml(interaction.name)}</code>${interaction.target ? ` on <code>&lt;${escHtml(interaction.target)}&gt;</code>` : ''} at ${fmtMs(interaction.startTime)}
 </div>`;
 
-    const stackedSegments = (() => {
-      let usedPct = 0;
-      return inpResult.phases.map(([name, dur], i) => {
-        const isLast = i === inpResult.phases.length - 1;
-        const exactPct = inp > 0 ? (dur / inp * 100) : 0;
-        const pct = isLast ? Math.max(0, 100 - usedPct) : exactPct;
-        usedPct += exactPct;
-        const bg = segColors[name] || '#94a3b8';
-        return pct > 0 ? `<div style="width:${pct}%;background:${bg};height:100%;display:inline-block" title="${escHtml(name)}: ${fmtMs(dur)} (${exactPct.toFixed(1)}%)"></div>` : '';
-      }).join('');
-    })();
-
-    const legend = inpResult.phases.map(([name]) => {
-      return `<span><span class="waterfall-legend-dot" style="background:${segColors[name] || '#94a3b8'}"></span> ${escHtml(name)}</span>`;
-    }).join(' ');
-
-    const rows = inpResult.phases.map(([name, dur]) => {
-      const share = inp > 0 ? (dur / inp * 100) : 0;
-      const isHighlight = share > 50 && inpRatingColor !== 'green';
-      const cellColor = isHighlight ? CSS_COLORS[inpRatingColor] : '';
-      const styleAttr = cellColor ? ` style="color:${cellColor}"` : '';
-      return `    <tr>
-      <td>${phaseLabel(name)}</td>
-      <td class="r"${styleAttr}>${fmtMs(dur)}</td>
-      <td class="r">${share.toFixed(1)}%</td>
-      <td><div class="bar-container"><div class="bar-fill" style="width:${share.toFixed(1)}%;background:${cellColor || '#3b82f6'}"></div></div></td>
-    </tr>`;
-    }).join('\n');
-
     const allInteractionsHtml = inpResult.allInteractions.length > 1 ? `
 <details style="margin-top:0.75rem">
   <summary style="cursor:pointer;font-size:0.875rem;color:#64748b">All interactions (${inpResult.allInteractions.length})</summary>
@@ -595,14 +508,7 @@ ${inpResult.allInteractions.map(e => {
 
     return `<p>Total INP: <strong style="color:${CSS_COLORS[inpRatingColor]}">${fmtMs(inp)}</strong> (worst interaction latency, synthetic)</p>
 ${infoHtml}
-<div class="waterfall-legend" style="margin-top:0.75rem">${legend}</div>
-<div style="background:#e2e8f0;border-radius:6px;height:20px;overflow:hidden;margin-bottom:1rem;font-size:0;line-height:0;white-space:nowrap">${stackedSegments}</div>
-<table>
-  <thead><tr><th>Phase</th><th class="r">Duration</th><th class="r">Share</th><th style="width:120px"></th></tr></thead>
-  <tbody>
-${rows}
-  </tbody>
-</table>${allInteractionsHtml}`;
+${renderBreakdownSection(inpResult.phases, inp, inpRatingColor, segColors)}${allInteractionsHtml}`;
   })()}
 
 <h2>TBT Breakdown</h2>

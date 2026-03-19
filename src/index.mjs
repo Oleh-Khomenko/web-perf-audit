@@ -19,62 +19,19 @@ import { runCalibration, CALIBRATION_DEVICES, DEFAULT_CALIBRATION_DEVICE } from 
 import { fmtMs, median } from './format.mjs';
 import { printReport, BOLD, DIM, RESET } from './report-console.mjs';
 import { generateHtml } from './report-html.mjs';
-
-// -- Throttle presets (matching Lighthouse/Chrome DevTools) --
-
-const THROTTLE_PRESETS = {
-  'slow-3g': { latency: 400, downloadThroughput: 50 * 1024, uploadThroughput: 25 * 1024, label: 'Slow 3G' },
-  'fast-3g': { latency: 150, downloadThroughput: 197 * 1024, uploadThroughput: 48 * 1024, label: 'Fast 3G' },
-  '4g':      { latency: 20,  downloadThroughput: 1500 * 1024, uploadThroughput: 750 * 1024, label: '4G' },
-};
-
-// -- Device presets (matching Lighthouse) --
-
-const DEVICE_PRESETS = {
-  desktop: {
-    label: 'Desktop',
-    width: 1440,
-    height: 920,
-    deviceScaleFactor: 1,
-    mobile: false,
-    userAgent: null, // use Chrome's default
-  },
-  tablet: {
-    label: 'Tablet (iPad Air)',
-    width: 820,
-    height: 1180,
-    deviceScaleFactor: 2,
-    mobile: true,
-    userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-  },
-  mobile: {
-    label: 'Mobile (Moto G Power)',
-    width: 412,
-    height: 823,
-    deviceScaleFactor: 2.625,
-    mobile: true,
-    userAgent: 'Mozilla/5.0 (Linux; Android 11; moto g power (2022)) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36',
-  },
-};
+import { parseArgs, DEVICE_PRESETS, THROTTLE_PRESETS } from './cli.mjs';
 
 // -- CLI args parsing --
 
-let TARGET_URL = 'http://localhost:3000';
-let NUM_RUNS = 1;
-let HTML_OUTPUT = null; // null = no HTML, true = auto-name, string = path
-let THROTTLE = null; // default: no throttling
-let CPU_THROTTLE = 1; // multiplier: 1 = no slowdown
-let DEVICE = DEVICE_PRESETS.desktop; // default: desktop
-let PARALLEL = false;
-let CALIBRATE_DEVICE = null;
-let CALIBRATE_CUSTOM_MS = null;
-let CPU_THROTTLE_EXPLICIT = false;
-let EXTRA_HEADERS = {};
-let EXTRA_COOKIES = [];
+let parsed;
+try {
+  parsed = parseArgs(process.argv.slice(2));
+} catch (err) {
+  console.error(err.message);
+  process.exit(1);
+}
 
-const args = process.argv.slice(2);
-
-if (args.includes('--help') || args.includes('-h')) {
+if (parsed.help) {
   console.log(`
   web-perf-audit — zero-dep Chrome CDP performance profiler
 
@@ -126,111 +83,22 @@ if (args.includes('--help') || args.includes('-h')) {
   process.exit(0);
 }
 
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === '--runs' && args[i + 1]) {
-    NUM_RUNS = Math.max(1, parseInt(args[i + 1], 10) || 1);
-    i++;
-  }
-  else if (args[i] === '--device' && args[i + 1]) {
-    const preset = args[i + 1];
-    if (!DEVICE_PRESETS[preset]) {
-      console.error(`Unknown device preset: "${preset}"\nAvailable presets: ${Object.keys(DEVICE_PRESETS).join(', ')}`);
-      process.exit(1);
-    }
-    DEVICE = DEVICE_PRESETS[preset];
-    i++;
-  }
-  else if (args[i] === '--throttle' && args[i + 1]) {
-    const preset = args[i + 1];
-    if (preset === 'none') {
-      THROTTLE = null;
-    }
-    else if (!THROTTLE_PRESETS[preset]) {
-      console.error(`Unknown throttle preset: "${preset}"\nAvailable presets: ${Object.keys(THROTTLE_PRESETS).join(', ')}, none`);
-      process.exit(1);
-    }
-    else {
-      THROTTLE = THROTTLE_PRESETS[preset];
-    }
-    i++;
-  }
-  else if (args[i] === '--cpu-throttle' && args[i + 1]) {
-    const rate = parseFloat(args[i + 1]);
-    if (isNaN(rate) || rate < 1) {
-      console.error(`Invalid CPU throttle rate: "${args[i + 1]}"\nMust be a number >= 1 (e.g. 4 = 4x slower)`);
-      process.exit(1);
-    }
-    CPU_THROTTLE = rate;
-    CPU_THROTTLE_EXPLICIT = true;
-    i++;
-  }
-  else if (args[i] === '--calibrate') {
-    // Peek at next arg — device key, custom ms value, or default
-    if (args[i + 1] && !args[i + 1].startsWith('--')) {
-      const val = args[i + 1];
-      const ms = Number(val);
-      if (!isNaN(ms) && ms > 0) {
-        CALIBRATE_DEVICE = 'custom';
-        CALIBRATE_CUSTOM_MS = ms;
-      } else if (CALIBRATION_DEVICES[val]) {
-        CALIBRATE_DEVICE = val;
-      } else {
-        console.error(`Unknown calibration device: "${val}"\nAvailable: ${Object.keys(CALIBRATION_DEVICES).join(', ')} or a number in ms (e.g. 500)`);
-        process.exit(1);
-      }
-      i++;
-    } else {
-      CALIBRATE_DEVICE = DEFAULT_CALIBRATION_DEVICE;
-    }
-  }
-  else if (args[i] === '--parallel') {
-    PARALLEL = true;
-  }
-  else if (args[i] === '--header' && args[i + 1]) {
-    const colonIdx = args[i + 1].indexOf(':');
-    if (colonIdx === -1) {
-      console.error(`Invalid header format: "${args[i + 1]}"\nExpected "Name: Value"`);
-      process.exit(1);
-    }
-    const name = args[i + 1].slice(0, colonIdx).trim();
-    const value = args[i + 1].slice(colonIdx + 1).trim();
-    EXTRA_HEADERS[name] = value;
-    i++;
-  }
-  else if (args[i] === '--cookie' && args[i + 1]) {
-    const eqIdx = args[i + 1].indexOf('=');
-    if (eqIdx === -1) {
-      console.error(`Invalid cookie format: "${args[i + 1]}"\nExpected "name=value"`);
-      process.exit(1);
-    }
-    const name = args[i + 1].slice(0, eqIdx).trim();
-    const value = args[i + 1].slice(eqIdx + 1).trim();
-    EXTRA_COOKIES.push({ name, value });
-    i++;
-  }
-  else if (args[i] === '--html') {
-    // Next arg is either a path or another flag (or nothing)
-    if (args[i + 1] && !args[i + 1].startsWith('--')) {
-      HTML_OUTPUT = args[i + 1];
-      i++;
-    }
-    else {
-      HTML_OUTPUT = true; // auto-generate filename
-    }
-  }
-  else if (!args[i].startsWith('--')) {
-    TARGET_URL = args[i];
-  }
-}
+let TARGET_URL = parsed.url;
+let NUM_RUNS = parsed.runs;
+let HTML_OUTPUT = parsed.htmlOutput;
+let THROTTLE = parsed.throttle;
+let CPU_THROTTLE = parsed.cpuThrottle;
+let DEVICE = parsed.device;
+let PARALLEL = parsed.parallel;
+let CALIBRATE_DEVICE = parsed.calibrateDevice;
+let CALIBRATE_CUSTOM_MS = parsed.calibrateCustomMs;
+let EXTRA_HEADERS = parsed.headers;
+let EXTRA_COOKIES = parsed.cookies;
 
 // -- Conflict warning --
-if (CALIBRATE_DEVICE && CPU_THROTTLE_EXPLICIT) {
+if (CALIBRATE_DEVICE && parsed.cpuThrottleExplicit) {
   console.warn('Warning: --calibrate and --cpu-throttle both set. --calibrate will override the manual value.');
 }
-
-// -- Validate URL early --
-try { new URL(TARGET_URL); }
-catch { console.error(`Invalid URL: "${TARGET_URL}"`); process.exit(1); }
 
 // -- Chrome discovery --
 
@@ -305,10 +173,37 @@ async function findChrome(chromeArgs, spawnOpts) {
   return null;
 }
 
+// -- Cleanup on interrupt --
+
+let _chromeProc = null;
+let _userDataDir = null;
+
+function cleanup() {
+  if (_chromeProc) {
+    _chromeProc.kill('SIGKILL');
+    _chromeProc = null;
+  }
+  if (_userDataDir) {
+    try { rmSync(_userDataDir, { recursive: true, force: true }); } catch {}
+    _userDataDir = null;
+  }
+}
+
+process.on('SIGINT', () => {
+  console.log(`\n${DIM}Interrupted — cleaning up...${RESET}`);
+  cleanup();
+  process.exit(130);
+});
+process.on('SIGTERM', () => {
+  cleanup();
+  process.exit(143);
+});
+
 // -- Main --
 
 async function main() {
   const userDataDir = mkdtempSync(join(tmpdir(), 'perf-audit-'));
+  _userDataDir = userDataDir;
   const debugPort = 9222 + Math.floor(Math.random() * 23000);
 
   // Launch Chrome
@@ -323,6 +218,7 @@ async function main() {
     'about:blank',
   ];
   const chromeProc = await findChrome(chromeArgs, { stdio: 'ignore' });
+  _chromeProc = chromeProc;
 
   if (!chromeProc) {
     const candidates = CHROME_PATHS_BY_PLATFORM[process.platform] ||
@@ -448,10 +344,20 @@ async function main() {
   else {
     // Run sequentially
     allResults = [];
+    const failures = [];
     for (let run = 0; run < NUM_RUNS; run++) {
       if (NUM_RUNS > 1) console.log(`${DIM}── Run ${run + 1}/${NUM_RUNS} ──${RESET}`);
-      allResults.push(await executeRun(run));
+      try {
+        allResults.push(await executeRun(run));
+      } catch (err) {
+        failures.push({ run: run + 1, message: err.message });
+        console.error(`  Run ${run + 1} failed: ${err.message}`);
+      }
     }
+    if (failures.length > 0 && allResults.length > 0) {
+      console.warn(`Warning: ${failures.length}/${NUM_RUNS} run(s) failed. Reporting from ${allResults.length} successful run(s).`);
+    }
+    if (allResults.length === 0) throw new Error('All runs failed');
   }
 
   browser.close();
@@ -546,8 +452,11 @@ async function main() {
 
   } finally {
     try { if (browser) browser.close(); } catch { /* ok */ }
+    console.log(`${DIM}Shutting down Chrome...${RESET}`);
     chromeProc.kill();
+    _chromeProc = null;
     try { rmSync(userDataDir, { recursive: true, force: true }); } catch { /* ok */ }
+    _userDataDir = null;
   }
 }
 

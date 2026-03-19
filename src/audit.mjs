@@ -2,10 +2,7 @@
  * CDP data collection logic — runs a single performance audit.
  */
 
-function safeJsonParse(value, fallback = null) {
-  try { return JSON.parse(value); }
-  catch { return fallback; }
-}
+import { safeJsonParse, computeClsFromEntries, tbtBlockingTime, computeTbt, processCoverageEntry, aggregateInlineScripts, buildResourceSummary } from './audit-utils.mjs';
 
 export async function runAudit(cdp, targetUrl, options = {}) {
   // Enable domains
@@ -341,32 +338,7 @@ export async function runAudit(cdp, targetUrl, options = {}) {
 
   // CLS spec: score = largest session window value (gap ≤ 1s, max 5s span).
   // The injected observer accumulates the raw sum; recompute per spec here.
-  {
-    const shifts = vitals.clsEntries
-      .filter(e => !e.hadRecentInput)
-      .sort((a, b) => a.startTime - b.startTime);
-    let maxWindowValue = 0;
-    if (shifts.length > 0) {
-      let winStart = shifts[0].startTime;
-      let winValue = shifts[0].value;
-      let prevEnd = shifts[0].startTime + (shifts[0].duration || 0);
-      for (let i = 1; i < shifts.length; i++) {
-        const s = shifts[i];
-        const gap = s.startTime - prevEnd;
-        const span = (s.startTime + (s.duration || 0)) - winStart;
-        if (gap <= 1000 && span <= 5000) {
-          winValue += s.value;
-        } else {
-          if (winValue > maxWindowValue) maxWindowValue = winValue;
-          winStart = s.startTime;
-          winValue = s.value;
-        }
-        prevEnd = s.startTime + (s.duration || 0);
-      }
-      if (winValue > maxWindowValue) maxWindowValue = winValue;
-    }
-    vitals.cls = maxWindowValue;
-  }
+  vitals.cls = computeClsFromEntries(vitals.clsEntries);
 
   // If LCP is 0 but FCP fired, LCP must be at least FCP.
   // The browser may not have emitted an LCP entry (heavy SPA, extreme throttle).
@@ -377,31 +349,11 @@ export async function runAudit(cdp, targetUrl, options = {}) {
   // TBT = sum of blocking time for long tasks between FCP and end of load.
   // Tasks straddling FCP are clipped: only the portion after FCP counts.
   const fcp = vitals.fcp || 0;
-  function tbtBlockingTime(lt) {
-    const taskEnd = lt.startTime + lt.duration;
-    if (taskEnd <= fcp) return 0;
-    const clippedDuration = taskEnd - Math.max(lt.startTime, fcp);
-    return Math.max(0, clippedDuration - 50);
-  }
-  const tbt = vitals.longTasks.reduce((sum, lt) => sum + tbtBlockingTime(lt), 0);
-
-  // Filter long tasks that overlap with FCP+ window for per-script aggregation
-  const longTasksAfterFcp = vitals.longTasks.filter(lt => lt.startTime + lt.duration > fcp);
-
-  // Aggregate long tasks by script URL (fall back to invoker for grouping)
-  const tbtByScriptMap = new Map();
-  for (const lt of longTasksAfterFcp) {
-    const key = lt.scriptUrl || lt.invoker || '';
-    const entry = tbtByScriptMap.get(key) || { scriptUrl: key, totalBlockingTime: 0, count: 0 };
-    entry.totalBlockingTime += tbtBlockingTime(lt);
-    entry.count++;
-    tbtByScriptMap.set(key, entry);
-  }
-  const tbtByScript = [...tbtByScriptMap.values()].sort((a, b) => b.totalBlockingTime - a.totalBlockingTime);
+  const { tbt, tbtByScript } = computeTbt(vitals.longTasks, fcp);
   // Update stored blockingTime to FCP-clipped values for consistent display.
   // LCP/INP phase breakdowns use duration (not blockingTime), so this is safe.
   for (const lt of vitals.longTasks) {
-    lt.blockingTime = tbtBlockingTime(lt);
+    lt.blockingTime = tbtBlockingTime(lt, fcp);
   }
   const longTaskDetails = vitals.longTasks;
 
@@ -431,14 +383,7 @@ export async function runAudit(cdp, targetUrl, options = {}) {
   const resourceEntries = safeJsonParse(resEntriesResult.value, []);
 
   // Resource summary (aggregated)
-  const resourceSummary = {};
-  for (const r of resourceEntries) {
-    const type = r.initiatorType || 'other';
-    if (!resourceSummary[type]) resourceSummary[type] = { count: 0, size: 0, time: 0 };
-    resourceSummary[type].count++;
-    resourceSummary[type].size += r.transferSize;
-    resourceSummary[type].time = Math.max(resourceSummary[type].time, r.duration);
-  }
+  const resourceSummary = buildResourceSummary(resourceEntries);
 
   // CPU profile (per-script execution time)
   const { profile } = await cdp.send('Profiler.stop');
@@ -469,68 +414,13 @@ export async function runAudit(cdp, targetUrl, options = {}) {
   await cdp.send('Profiler.disable');
 
   const jsCoverage = coverageResult.result.map((entry) => {
-    // Collect all ranges and merge overlapping ones to avoid double-counting
-    const allRanges = [];
-    for (const fn of entry.functions) {
-      for (const range of fn.ranges) {
-        allRanges.push([range.startOffset, range.endOffset]);
-      }
-    }
-    allRanges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-
-    let used = 0;
-    let mergedEnd = 0;
-    for (const [start, end] of allRanges) {
-      const effectiveStart = Math.max(start, mergedEnd);
-      if (effectiveStart < end) {
-        used += end - effectiveStart;
-        mergedEnd = end;
-      }
-    }
-
-    const total = entry.source ? entry.source.length : 0;
-    // If source not available, estimate from max end offset
-    const estimatedTotal = total || allRanges.reduce((max, r) => r[1] > max ? r[1] : max, 0);
-    used = Math.min(used, estimatedTotal);
-    const unused = estimatedTotal - used;
-    // Execution time in ms (from CPU profile, microseconds → ms)
     const execTimeUs = execTimeByUrl.get(entry.url) || 0;
-    return {
-      url: entry.url,
-      total: estimatedTotal,
-      used,
-      unused,
-      unusedPct: estimatedTotal > 0 ? (unused / estimatedTotal * 100) : 0,
-      execTime: execTimeUs / 1000,
-    };
+    return processCoverageEntry(entry, execTimeUs);
   }).filter(e => e.url && e.total > 0 && !e.url.startsWith('chrome-error://') && !e.url.startsWith('chrome-extension://'));
 
   // Aggregate inline scripts that share the page URL into a single entry
-  const jsCoverageGrouped = [];
-  const inlineEntries = [];
   const pageUrls = new Set([targetUrl, nav.name]);
-  for (const e of jsCoverage) {
-    // Inline scripts have the page URL rather than a separate .js URL
-    if (pageUrls.has(e.url)) {
-      inlineEntries.push(e);
-    } else {
-      jsCoverageGrouped.push(e);
-    }
-  }
-  if (inlineEntries.length > 0) {
-    const total = inlineEntries.reduce((s, e) => s + e.total, 0);
-    const used = inlineEntries.reduce((s, e) => s + e.used, 0);
-    const unused = total - used;
-    const execTime = inlineEntries.reduce((s, e) => s + e.execTime, 0);
-    jsCoverageGrouped.push({
-      url: `(inline <script>) × ${inlineEntries.length}`,
-      total,
-      used,
-      unused,
-      unusedPct: total > 0 ? (unused / total * 100) : 0,
-      execTime,
-    });
-  }
+  const jsCoverageGrouped = aggregateInlineScripts(jsCoverage, pageUrls);
 
   // Preload links from DOM
   const { result: preloadResult } = await cdp.send('Runtime.evaluate', {
